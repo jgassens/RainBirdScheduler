@@ -132,7 +132,13 @@ const HELP = {
     zones one-at-a-time, adding inter-zone gaps, and applying policies. If
     three zones all request 9:00, only the first is planned at 9:00 — the
     others are planned to follow it. The panel never blurs the two.</p>
-    <p><b class="k">Runtime column</b> — the whole-minute value actually sent
+    <p><b class="k">Schedule timeline</b> — one row per day for the coming
+    week, on a shared hour axis. Each colored bar is one zone cycle (color =
+    zone, see the legend); hover any bar for the program, zone, exact window
+    and runtime. A dashed line marks "now" on today's row, and a ⚠️ next to a
+    day means a program that day will not water at all. The exact
+    requested-vs-planned times live in the collapsible table underneath.</p>
+    <p><b class="k">Runtime figures</b> — the whole-minute value actually sent
     to the controller, with the exact pre-quantization figure beside it
     (e.g. "14 min (14.4 exact)").</p>
     <p><b class="k">Buttons</b> — <i>Stop controller</i> halts ALL watering
@@ -471,7 +477,15 @@ class RainBirdSchedulerPanel extends HTMLElement {
       :host { display:block; height:100%; overflow:auto;
         background: var(--primary-background-color, #fafafa);
         color: var(--primary-text-color, #212121);
-        font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif); }
+        font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
+        /* Categorical zone palette (validated, fixed slot order) + chart ink. */
+        --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+        --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
+        --tl-grid:#e1e0d9; --tl-muted:#898781; --tl-ink2:#52514e; }
+      :host([dark]) {
+        --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+        --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+        --tl-grid:#2c2c2a; --tl-ink2:#c3c2b7; }
       .topbar { display:flex; align-items:center; gap:16px; padding:12px 20px;
         background: var(--app-header-background-color, #03a9f4);
         color: var(--app-header-text-color, #fff); position:sticky; top:0; z-index:5;}
@@ -517,6 +531,29 @@ class RainBirdSchedulerPanel extends HTMLElement {
         color:#5d4037; border-radius:8px; padding:10px 14px; margin:0 0 14px;
         line-height:1.5; font-size:13px; }
       .banner.warn b { color:#e65100; display:block; margin-bottom:4px; }
+      .tl-card { position:relative; padding:14px 16px 10px; }
+      .tl-grid { stroke:var(--tl-grid); stroke-width:1; }
+      .tl-tick { fill:var(--tl-muted); font-size:11px; }
+      .tl-day { fill:var(--tl-ink2); font-size:12px; }
+      .tl-day.today { fill:var(--primary-text-color,#212121); font-weight:600; }
+      .tl-badge { font-size:11px; cursor:help; }
+      .tl-empty { fill:var(--tl-muted); font-size:11px; font-style:italic; }
+      .tl-bar { stroke:var(--card-background-color,#fff); stroke-width:1; }
+      .tl-bar:hover { filter:brightness(1.15); }
+      .tl-now { stroke:var(--tl-muted); stroke-width:1; stroke-dasharray:3 3; }
+      .tl-nowlabel { fill:var(--tl-muted); font-size:10px; }
+      .tl-legend { display:flex; flex-wrap:wrap; gap:4px 16px; padding:8px 4px 2px;
+        font-size:12px; color:var(--tl-ink2); }
+      .tl-key { display:inline-flex; align-items:center; gap:6px; }
+      .tl-swatch { width:12px; height:12px; border-radius:3px; display:inline-block; }
+      .tl-tip { position:fixed; z-index:20; display:none; pointer-events:none;
+        background:var(--card-background-color,#fff); color:var(--primary-text-color,#212121);
+        border:1px solid var(--divider-color,#e0e0e0); border-radius:8px;
+        box-shadow:0 2px 10px rgba(0,0,0,.18); padding:6px 10px; font-size:12px;
+        line-height:1.5; white-space:pre-line; max-width:320px; }
+      .tview { margin-top:10px; }
+      .tview summary { cursor:pointer; font-size:13px; padding:6px 2px;
+        color:var(--secondary-text-color,#666); user-select:none; }
       .section { margin:22px 0 10px; font-size:16px; font-weight:500; }
       .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:6px 0;}
       label.f { display:flex; flex-direction:column; font-size:12px; gap:3px;
@@ -569,6 +606,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
 
   render() {
     if (!this._config || !this._state) return;
+    this.toggleAttribute("dark", !!this._hass?.themes?.darkMode);
     const tabs = [
       ["overview", "Overview"],
       ["programs", "Programs"],
@@ -651,7 +689,37 @@ class RainBirdSchedulerPanel extends HTMLElement {
     root.querySelectorAll("[data-z]").forEach((input) =>
       input.addEventListener("change", () => this._recordZoneEdit(input)),
     );
+    this._wireTimelineTooltip();
     if (this._draft) this._wireEditor();
+  }
+
+  _wireTimelineTooltip() {
+    const root = this.shadowRoot;
+    const svg = root.getElementById("tl-svg");
+    const tip = root.getElementById("tl-tip");
+    if (!svg || !tip) return;
+    svg.addEventListener("mousemove", (event) => {
+      const bar = event.target.closest("[data-tip]");
+      if (!bar) {
+        tip.style.display = "none";
+        return;
+      }
+      tip.textContent = bar.dataset.tip;
+      tip.style.display = "block";
+      const pad = 12;
+      const box = tip.getBoundingClientRect();
+      let left = event.clientX + pad;
+      let top = event.clientY + pad;
+      if (left + box.width > window.innerWidth - 8)
+        left = event.clientX - box.width - pad;
+      if (top + box.height > window.innerHeight - 8)
+        top = event.clientY - box.height - pad;
+      tip.style.left = `${left}px`;
+      tip.style.top = `${top}px`;
+    });
+    svg.addEventListener("mouseleave", () => {
+      tip.style.display = "none";
+    });
   }
 
   /* Zones-tab edits accumulate in _zoneEdits (zone_id → {field: raw value})
@@ -731,6 +799,183 @@ class RainBirdSchedulerPanel extends HTMLElement {
     return rows.slice(0, limit);
   }
 
+  /* Zone → categorical color slot, fixed by station order so a zone keeps
+   * its color across renders, filters, and program edits (color follows the
+   * entity, never its position in today's plan). 8 slots, then wrap. */
+  _zoneSlots() {
+    const zones = Object.values(this._config?.zones || {})
+      .slice()
+      .sort(
+        (a, b) => a.reference.station_number - b.reference.station_number,
+      );
+    const slots = {};
+    zones.forEach((zone, index) => (slots[zone.id] = index % 8));
+    return slots;
+  }
+
+  /* Gantt-style schedule: one row per day for the 7-day horizon, bars are
+   * compiled zone cycles, colored per zone, on a shared hour axis so the
+   * daily watering rhythm reads at a glance. SVG built as strings — no
+   * dependencies, CSP-safe, theme-aware via CSS custom properties. */
+  _renderTimeline() {
+    const runs = this._timeline?.runs || [];
+    const slots = this._zoneSlots();
+    const items = [];
+    for (const run of runs) {
+      for (const step of run.steps || []) {
+        items.push({
+          run,
+          step,
+          start: new Date(step.planned_start_utc),
+          end: new Date(step.planned_end_utc),
+        });
+      }
+    }
+    if (!items.length)
+      return '<div class="card muted">Nothing scheduled in the next 7 days</div>';
+
+    const now = new Date();
+    const day0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const days = Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(day0);
+      date.setDate(day0.getDate() + index);
+      return date;
+    });
+    const dayKey = (date) =>
+      `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+    const byDay = new Map(days.map((date) => [dayKey(date), []]));
+    for (const item of items) {
+      const key = dayKey(item.start);
+      if (byDay.has(key)) byDay.get(key).push(item);
+    }
+
+    // Fully-skipped occurrences (zero steps) become a day-row warning badge.
+    const badges = new Map();
+    for (const run of runs) {
+      if ((run.steps || []).length || !(run.skipped_zones || []).length)
+        continue;
+      const key = dayKey(new Date(run.requested_start_utc));
+      badges.set(
+        key,
+        [...(badges.get(key) || []), `${run.program_name}: will not water`],
+      );
+    }
+
+    // Shared hour domain across all rows so days align vertically.
+    const sameDay = (a, b) => dayKey(a) === dayKey(b);
+    const hourOf = (date) =>
+      date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
+    let lo = 24;
+    let hi = 0;
+    for (const { start, end } of items) {
+      lo = Math.min(lo, hourOf(start));
+      hi = Math.max(hi, sameDay(start, end) ? hourOf(end) : 24);
+    }
+    lo = Math.max(0, Math.floor(lo) - 1);
+    hi = Math.min(24, Math.ceil(hi) + 1);
+    while (hi - lo < 4) {
+      if (lo > 0) lo -= 1;
+      if (hi < 24 && hi - lo < 4) hi += 1;
+      if (lo === 0 && hi === 24) break;
+    }
+    const span = hi - lo;
+    const tickStep = span <= 8 ? 1 : span <= 14 ? 2 : 3;
+
+    const W = 980;
+    const GL = 100;
+    const GR = 14;
+    const AX = 22;
+    const ROW = 30;
+    const BAR = 16;
+    const H = AX + days.length * ROW + 6;
+    const xAt = (hour) => GL + ((hour - lo) / span) * (W - GL - GR);
+    const fmtHour = (hour) =>
+      new Date(2000, 0, 1, hour).toLocaleTimeString([], { hour: "numeric" });
+    const fmtShort = (date) =>
+      date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+    let grid = "";
+    for (let hour = Math.ceil(lo); hour <= hi; hour += tickStep) {
+      const gx = xAt(hour);
+      grid += `<line x1="${gx}" y1="${AX - 4}" x2="${gx}" y2="${H - 4}" class="tl-grid"/>
+        <text x="${gx}" y="${AX - 9}" class="tl-tick" text-anchor="middle">${esc(fmtHour(hour))}</text>`;
+    }
+
+    let rows = "";
+    days.forEach((date, index) => {
+      const y = AX + index * ROW;
+      const key = dayKey(date);
+      const dayItems = byDay.get(key) || [];
+      const isToday = index === 0;
+      const label = date.toLocaleDateString([], {
+        weekday: "short",
+        month: "short",
+        day: "numeric",
+      });
+      rows += `<text x="${GL - 10}" y="${y + ROW / 2 + 4}" text-anchor="end"
+        class="tl-day ${isToday ? "today" : ""}">${esc(label)}</text>`;
+      if (badges.has(key)) {
+        rows += `<text x="${GL - 10}" y="${y + ROW - 2}" text-anchor="end" class="tl-badge">
+          <title>${esc(badges.get(key).join("\n"))}</title>⚠️</text>`;
+      }
+      if (!dayItems.length) {
+        rows += `<text x="${GL + 8}" y="${y + ROW / 2 + 4}" class="tl-empty">no watering</text>`;
+        return;
+      }
+      for (const { run, step, start, end } of dayItems) {
+        const x1 = xAt(Math.max(lo, hourOf(start)));
+        const x2 = sameDay(start, end)
+          ? xAt(Math.min(hi, hourOf(end)))
+          : xAt(hi);
+        const width = Math.max(5, x2 - x1);
+        const slot = (slots[step.zone_id] ?? 0) + 1;
+        const cycle =
+          step.cycle_count > 1
+            ? ` · cycle ${step.cycle_index}/${step.cycle_count}`
+            : "";
+        const tip =
+          `${run.program_name} — ${step.zone_name}${cycle}\n` +
+          `${fmtShort(start)}–${fmtShort(end)} · ${step.duration_minutes} min` +
+          ` (${step.exact_minutes} exact)`;
+        rows += `<rect x="${x1}" y="${y + (ROW - BAR) / 2}" width="${width}" height="${BAR}"
+          rx="2" class="tl-bar" style="fill:var(--s${slot})" data-tip="${esc(tip)}">
+          <title>${esc(tip)}</title></rect>`;
+      }
+    });
+
+    let nowLine = "";
+    const nowHour = hourOf(now);
+    if (nowHour >= lo && nowHour <= hi) {
+      const nx = xAt(nowHour);
+      nowLine = `<line x1="${nx}" y1="${AX}" x2="${nx}" y2="${AX + ROW}" class="tl-now"/>
+        <text x="${nx}" y="${AX + ROW + 9}" class="tl-nowlabel" text-anchor="middle">now</text>`;
+    }
+
+    // Legend: zones that appear in the plan, in slot (station) order.
+    const seen = new Map();
+    for (const { step } of items)
+      if (!seen.has(step.zone_id)) seen.set(step.zone_id, step.zone_name);
+    const legend = [...seen.entries()]
+      .sort((a, b) => (slots[a[0]] ?? 0) - (slots[b[0]] ?? 0))
+      .map(
+        ([zoneId, name]) =>
+          `<span class="tl-key"><span class="tl-swatch"
+            style="background:var(--s${(slots[zoneId] ?? 0) + 1})"></span>${esc(name)}</span>`,
+      )
+      .join("");
+
+    return `
+      <div class="card tl-card">
+        <svg id="tl-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
+          style="width:100%;height:auto;display:block" role="img"
+          aria-label="Watering schedule for the next 7 days">
+          ${grid}${nowLine}${rows}
+        </svg>
+        <div class="tl-legend">${legend}</div>
+        <div id="tl-tip" class="tl-tip"></div>
+      </div>`;
+  }
+
   _renderOverview() {
     const state = this._state;
     const controller = this._config.controller;
@@ -743,7 +988,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
       state.executor_state,
     );
 
-    const upcoming = this._upcomingSteps()
+    const upcoming = this._upcomingSteps(100)
       .map(
         ({ run, step }) => `
         <tr>
@@ -857,12 +1102,16 @@ class RainBirdSchedulerPanel extends HTMLElement {
         <button class="btn ghost" data-action="recalculate">Recalculate</button>
       </div>
 
-      <div class="section">Upcoming (compiled plan)</div>
-      <table>
-        <tr><th>Program</th><th>Zone</th><th>Requested</th><th>Planned start</th>
-        <th>Planned end</th><th>Runtime</th></tr>
-        ${upcoming || '<tr><td colspan="6" class="muted">Nothing scheduled in the next 7 days</td></tr>'}
-      </table>
+      <div class="section">Schedule (next 7 days)</div>
+      ${this._renderTimeline()}
+      <details class="tview">
+        <summary>Table view (exact requested vs planned times)</summary>
+        <table>
+          <tr><th>Program</th><th>Zone</th><th>Requested</th><th>Planned start</th>
+          <th>Planned end</th><th>Runtime</th></tr>
+          ${upcoming || '<tr><td colspan="6" class="muted">Nothing scheduled in the next 7 days</td></tr>'}
+        </table>
+      </details>
       ${conflicts ? `<div class="section">Conflicts</div>${conflicts}` : ""}
       ${skipped ? `<div class="section">Planned skips</div>${skipped}` : ""}
     `;
