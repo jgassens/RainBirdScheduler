@@ -228,7 +228,9 @@ const HELP = {
     AGEN-PU-217): clay = short cycles with a 60-minute soak, loam ≈ 9–12 min
     cycles with 40-minute soaks, sand barely needs cycling; steeper slope
     always shortens the cycle. The numbers land in the editable boxes and
-    save ONLY when you press Save — nothing changes invisibly. Those figures
+    save ONLY when you press <i>Save changes</i> — nothing changes
+    invisibly. Edited rows are highlighted until then, and <i>Discard</i>
+    puts every row back. Those figures
     assume spray heads; low-precipitation rotor zones can run roughly 3×
     longer before runoff, so raise them if that is what the zone uses.</p>
     <p><b class="k">Max cycle</b> — longest single burst allowed. Jonny's 24
@@ -546,6 +548,8 @@ class RainBirdSchedulerPanel extends HTMLElement {
         background:var(--secondary-background-color,#f0f7fa);
         color:var(--primary-text-color,#212121); }
       .suggest-hint:empty { display:none; }
+      .btn:disabled { opacity:.45; cursor:default; }
+      tr.dirty td { background: rgba(3,169,244,.08); }
       .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
       @media (max-width:800px){ .grid2 { grid-template-columns:1fr; } }
     `;
@@ -630,6 +634,8 @@ class RainBirdSchedulerPanel extends HTMLElement {
     if (entrySelect)
       entrySelect.addEventListener("change", async (event) => {
         this._entryId = event.target.value;
+        this._zoneEdits = {};
+        this._suggestHint = "";
         await this._loadAll();
         this._subscribe();
       });
@@ -642,54 +648,70 @@ class RainBirdSchedulerPanel extends HTMLElement {
         ),
       ),
     );
-    root
-      .querySelectorAll('select[data-f="soil_type"], select[data-f="slope_class"]')
-      .forEach((select) =>
-        select.addEventListener("change", () =>
-          this._suggestCycleSoak(select.dataset.z),
-        ),
-      );
+    root.querySelectorAll("[data-z]").forEach((input) =>
+      input.addEventListener("change", () => this._recordZoneEdit(input)),
+    );
     if (this._draft) this._wireEditor();
   }
 
-  /* Fill one zone row's Max cycle / Min soak inputs with the published
-   * starting point for its soil+slope. Direct DOM writes only — no re-render
-   * (that would discard other unsaved rows) and no save (Save persists). */
+  /* Zones-tab edits accumulate in _zoneEdits (zone_id → {field: raw value})
+   * so live state pushes can re-render without eating unsaved work. A field
+   * set back to its stored value un-dirties itself. */
+  _setZoneEdit(zoneId, field, value) {
+    const zone = this._config.zones[zoneId];
+    if (!zone) return;
+    const edits = ((this._zoneEdits ??= {})[zoneId] ??= {});
+    const original =
+      typeof value === "boolean"
+        ? !!zone[field]
+        : String(zone[field] ?? "");
+    if (value === original) delete edits[field];
+    else edits[field] = value;
+    if (!Object.keys(edits).length) delete this._zoneEdits[zoneId];
+  }
+
+  _recordZoneEdit(input) {
+    const zoneId = input.dataset.z;
+    const field = input.dataset.f;
+    this._setZoneEdit(
+      zoneId,
+      field,
+      input.type === "checkbox" ? input.checked : input.value,
+    );
+    if (field === "soil_type" || field === "slope_class")
+      this._suggestCycleSoak(zoneId);
+    this.render();
+  }
+
+  /* Put the published Cycle+Soak starting point for the zone's soil+slope
+   * into the edit buffer (plan §16: suggestions, never invisible behavior —
+   * the values appear in the boxes and persist only via Save). */
   _suggestCycleSoak(zoneId) {
-    const root = this.shadowRoot;
-    const field = (name) =>
-      root.querySelector(`[data-z="${zoneId}"][data-f="${name}"]`);
-    const hint = root.getElementById("cycle-soak-hint");
-    const say = (message) => {
-      if (hint) hint.textContent = message;
-    };
-    const soil = field("soil_type")?.value;
-    const slope = field("slope_class")?.value;
-    const name =
-      this._config.zones[zoneId]?.display_name || `station ${zoneId}`;
+    const zone = this._config.zones[zoneId];
+    if (!zone) return;
+    const edits = (this._zoneEdits ?? {})[zoneId] || {};
+    const soil = edits.soil_type ?? zone.soil_type;
+    const slope = edits.slope_class ?? zone.slope_class;
+    const name = zone.display_name || `station ${zoneId}`;
     if (!soil || soil === "unknown") {
-      say(`${name}: pick a soil type to get a Cycle+Soak starting point.`);
+      this._suggestHint = `${name}: pick a soil type to get a Cycle+Soak starting point.`;
       return;
     }
     const suggestion = CYCLE_SOAK_SUGGESTIONS[`${soil}|${slope}`];
     if (!suggestion) {
-      say(
+      this._suggestHint =
         `${name}: sand on flat ground usually absorbs water as fast as ` +
-          `sprinklers apply it — Cycle+Soak is rarely needed. Leave Max ` +
-          `cycle and Min soak blank unless you actually see runoff.`,
-      );
+        `sprinklers apply it — Cycle+Soak is rarely needed. Leave Max ` +
+        `cycle and Min soak blank unless you actually see runoff.`;
       return;
     }
-    const cycleInput = field("max_cycle_minutes");
-    const soakInput = field("minimum_soak_minutes");
-    if (cycleInput) cycleInput.value = suggestion.cycle;
-    if (soakInput) soakInput.value = suggestion.soak;
-    say(
+    this._setZoneEdit(zoneId, "max_cycle_minutes", String(suggestion.cycle));
+    this._setZoneEdit(zoneId, "minimum_soak_minutes", String(suggestion.soak));
+    this._suggestHint =
       `${name}: suggested ${suggestion.cycle} min max cycle / ` +
-        `${suggestion.soak} min soak for ${soil} + ${slope} slope ` +
-        `(Texas A&M AgriLife spray-head guidance; rotor zones can run ~3× ` +
-        `longer). Adjust freely, then press Save on that row.`,
-    );
+      `${suggestion.soak} min soak for ${soil} + ${slope} slope ` +
+      `(Texas A&M AgriLife spray-head guidance; rotor zones can run ~3× ` +
+      `longer). Adjust freely, then press Save changes.`;
   }
 
   // ------------------------------------------------------------------
@@ -1281,56 +1303,68 @@ class RainBirdSchedulerPanel extends HTMLElement {
     zones.sort(
       (a, b) => a.reference.station_number - b.reference.station_number,
     );
+    const allEdits = this._zoneEdits ?? {};
     const rows = zones
-      .map(
-        (zone) => `
-      <tr data-zone-row="${zone.id}">
+      .map((zone) => {
+        const edits = allEdits[zone.id] || {};
+        const val = (field) => esc(edits[field] ?? zone[field] ?? "");
+        const on = edits.enabled ?? zone.enabled;
+        const soilNow = edits.soil_type ?? zone.soil_type;
+        const slopeNow = edits.slope_class ?? zone.slope_class;
+        const policyNow =
+          edits.minimum_runtime_policy ?? zone.minimum_runtime_policy ?? "";
+        return `
+      <tr data-zone-row="${zone.id}" class="${Object.keys(edits).length ? "dirty" : ""}">
         <td>${zone.reference.station_number}</td>
-        <td><input data-z="${zone.id}" data-f="display_name" value="${esc(zone.display_name)}"></td>
+        <td><input data-z="${zone.id}" data-f="display_name" value="${val("display_name")}"></td>
         <td class="muted">${esc(zone.reference.last_known_entity_id)}</td>
-        <td><input type="checkbox" data-z="${zone.id}" data-f="enabled" ${zone.enabled ? "checked" : ""}></td>
+        <td><input type="checkbox" data-z="${zone.id}" data-f="enabled" ${on ? "checked" : ""}></td>
         <td><input type="number" style="width:70px" step="0.5" min="0"
-          data-z="${zone.id}" data-f="base_runtime_minutes" value="${zone.base_runtime_minutes}"></td>
+          data-z="${zone.id}" data-f="base_runtime_minutes" value="${val("base_runtime_minutes")}"></td>
         <td><select data-z="${zone.id}" data-f="soil_type">${SOILS.map(
           (soil) =>
-            `<option value="${soil}" ${zone.soil_type === soil ? "selected" : ""}>${soil}</option>`,
+            `<option value="${soil}" ${soilNow === soil ? "selected" : ""}>${soil}</option>`,
         ).join("")}</select></td>
         <td><select data-z="${zone.id}" data-f="slope_class">${SLOPES.map(
           (slope) =>
-            `<option value="${slope}" ${zone.slope_class === slope ? "selected" : ""}>${slope}</option>`,
+            `<option value="${slope}" ${slopeNow === slope ? "selected" : ""}>${slope}</option>`,
         ).join("")}</select></td>
         <td><input type="number" style="width:60px" min="0" placeholder="—"
-          data-z="${zone.id}" data-f="max_cycle_minutes" value="${zone.max_cycle_minutes ?? ""}"></td>
+          data-z="${zone.id}" data-f="max_cycle_minutes" value="${val("max_cycle_minutes")}"></td>
         <td><input type="number" style="width:60px" min="0" placeholder="—"
-          data-z="${zone.id}" data-f="minimum_soak_minutes" value="${zone.minimum_soak_minutes ?? ""}"></td>
+          data-z="${zone.id}" data-f="minimum_soak_minutes" value="${val("minimum_soak_minutes")}"></td>
         <td><select data-z="${zone.id}" data-f="minimum_runtime_policy">${MIN_RUNTIME.map(
           ([value, label]) =>
-            `<option value="${value}" ${(zone.minimum_runtime_policy ?? "") === value ? "selected" : ""}>${label}</option>`,
+            `<option value="${value}" ${policyNow === value ? "selected" : ""}>${label}</option>`,
         ).join("")}</select></td>
-        <td><button class="btn small" data-action="save-zone" data-id="${zone.id}">Save</button></td>
-      </tr>`,
-      )
+      </tr>`;
+      })
       .join("");
+    const dirty = Object.keys(allEdits).length;
     return `
       ${helpBlock("zones", "runtimes, soil and Cycle+Soak")}
-      <div class="sub" style="margin-bottom:8px">Changing Soil or Slope fills Max
-        cycle / Min soak with published starting points (Texas A&amp;M AgriLife
-        runoff guidance) — visible in the boxes, editable, and applied only when
-        you press Save. Runtimes are quantized once to whole minutes (round half
-        up) when a plan is compiled.</div>
+      <div class="row" style="justify-content:space-between">
+        <div class="sub" style="flex:1">Changing Soil or Slope fills Max cycle /
+          Min soak with published starting points (Texas A&amp;M AgriLife runoff
+          guidance) — visible in the boxes, editable, and applied only when you
+          save. Runtimes are quantized once to whole minutes (round half up)
+          when a plan is compiled.</div>
+        <div>
+          ${dirty ? '<button class="btn ghost" data-action="discard-zone-edits">Discard</button>' : ""}
+          <button class="btn" data-action="save-zones" ${dirty ? "" : "disabled"}>
+            Save changes${dirty ? ` (${dirty} zone${dirty > 1 ? "s" : ""})` : ""}</button>
+        </div>
+      </div>
       <table>
         <tr><th>Station</th><th>Name</th><th>Source entity</th><th>On</th>
           <th>Base (min)</th><th>Soil</th><th>Slope</th><th>Max cycle</th>
-          <th>Min soak</th><th>Sub-minute policy</th><th></th></tr>
-        ${rows || '<tr><td colspan="11" class="muted">No zones discovered</td></tr>'}
+          <th>Min soak</th><th>Sub-minute policy</th></tr>
+        ${rows || '<tr><td colspan="10" class="muted">No zones discovered</td></tr>'}
       </table>
-      <div class="suggest-hint" id="cycle-soak-hint"></div>`;
+      ${this._suggestHint ? `<div class="suggest-hint">${esc(this._suggestHint)}</div>` : ""}`;
   }
 
-  async _saveZone(zoneId) {
-    const zone = this._config.zones[zoneId];
-    const root = this.shadowRoot;
-    const patch = {};
+  async _saveZones() {
     // Only these zone fields accept null on the backend; clearing any
     // other input must not persist null (it would poison recalculation).
     const nullable = [
@@ -1338,32 +1372,55 @@ class RainBirdSchedulerPanel extends HTMLElement {
       "minimum_soak_minutes",
       "minimum_runtime_policy",
     ];
-    for (const input of root.querySelectorAll(`[data-z="${zoneId}"]`)) {
-      const field = input.dataset.f;
-      if (input.type === "checkbox") patch[field] = input.checked;
-      else if (input.value === "" || input.value == null) {
-        if (!nullable.includes(field)) {
-          this._toastMsg(`${field.replace(/_/g, " ")} cannot be empty.`);
-          return;
-        }
-        patch[field] = null;
-      } else if (
-        ["max_cycle_minutes", "minimum_soak_minutes"].includes(field)
-      )
-        patch[field] = Number(input.value);
-      else patch[field] = String(input.value);
+    const patches = [];
+    for (const [zoneId, edits] of Object.entries(this._zoneEdits ?? {})) {
+      const zone = this._config.zones[zoneId];
+      if (!zone) continue;
+      const patch = {};
+      for (const [field, raw] of Object.entries(edits)) {
+        if (typeof raw === "boolean") {
+          patch[field] = raw;
+        } else if (raw === "" || raw == null) {
+          if (!nullable.includes(field)) {
+            this._toastMsg(
+              `${zone.display_name}: ${field.replace(/_/g, " ")} cannot be empty.`,
+            );
+            return;
+          }
+          patch[field] = null;
+        } else if (
+          ["max_cycle_minutes", "minimum_soak_minutes"].includes(field)
+        )
+          patch[field] = Number(raw);
+        else patch[field] = String(raw);
+      }
+      if (Object.keys(patch).length) patches.push([zoneId, patch]);
     }
-    if (patch.minimum_runtime_policy === "") patch.minimum_runtime_policy = null;
-    await this._action(
-      this.api({
-        type: `${DOMAIN}/zone/update`,
-        entry_id: this._entryId,
-        zone_id: zoneId,
-        expected_revision: zone.revision,
-        patch,
-      }),
-      "Zone saved",
-    );
+    if (!patches.length) return;
+    let saved = 0;
+    let failed = 0;
+    for (const [zoneId, patch] of patches) {
+      try {
+        await this.api({
+          type: `${DOMAIN}/zone/update`,
+          entry_id: this._entryId,
+          zone_id: zoneId,
+          expected_revision: this._config.zones[zoneId].revision,
+          patch,
+        });
+        delete this._zoneEdits[zoneId];
+        saved += 1;
+      } catch (err) {
+        failed += 1;
+        if (err && err.code === "revision_conflict") await this._loadConfig();
+        this._toastMsg(
+          `${this._config.zones[zoneId]?.display_name || zoneId}: ` +
+            `${err.message || err.code || err}`,
+        );
+      }
+    }
+    if (saved && !failed)
+      this._toastMsg(`Saved ${saved} zone${saved > 1 ? "s" : ""}.`);
     await this._loadAll();
   }
 
@@ -1645,8 +1702,13 @@ class RainBirdSchedulerPanel extends HTMLElement {
         this._draft.nominal_start_times.splice(Number(data.index), 1);
         this.render();
         break;
-      case "save-zone":
-        await this._saveZone(data.id);
+      case "save-zones":
+        await this._saveZones();
+        break;
+      case "discard-zone-edits":
+        this._zoneEdits = {};
+        this._suggestHint = "";
+        this.render();
         break;
       case "select-run":
         this._selectedRun = data.id;
