@@ -1,0 +1,61 @@
+[project]
+name = "rainbird-scheduler"
+version = "0.1.0"
+description = "Intent-based irrigation scheduler for Home Assistant, built on the core rainbird integration"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+extend-exclude = ["custom_components/rainbird_scheduler/frontend"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # bugbear
+    "SIM",    # simplify
+    "C4",     # comprehensions
+    "RUF",    # ruff-specific
+    "ASYNC",  # async checks
+]
+ignore = [
+    "E501",   # line length is enforced by the formatter
+    "SIM105", # contextlib.suppress is not always clearer
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components.rainbird_scheduler"]
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.13"
+packages = ["custom_components.rainbird_scheduler"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_return_any = true
+show_error_codes = true
+follow_imports = "silent"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
