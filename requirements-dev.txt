@@ -2,7 +2,7 @@
 # matching homeassistant version itself.
 pytest-homeassistant-custom-component==0.13.316
 home-assistant-frontend==20260128.6
-pyrainbird==6.5.0
+pyrainbird==6.0.5
 hypothesis==6.165.9
 ruff==0.16.3
 mypy==2.3.1
