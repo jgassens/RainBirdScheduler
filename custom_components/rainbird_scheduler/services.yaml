@@ -1,0 +1,95 @@
+run_program:
+  fields:
+    program_id:
+      required: true
+      example: "3f9c2b1a4d5e6f70"
+      selector:
+        text:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler
+
+run_zones:
+  fields:
+    zones:
+      required: true
+      example: |
+        - entity_id: switch.front_lawn
+          duration: 12
+        - entity_id: switch.side_lawn
+          duration: 8
+      selector:
+        object:
+
+stop_controller:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler
+
+pause:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler
+
+resume:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler
+
+skip_current:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler
+
+recalculate:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler
+
+set_program_enabled:
+  fields:
+    program_id:
+      required: true
+      selector:
+        text:
+    enabled:
+      required: true
+      selector:
+        boolean:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler
+
+set_rain_delay:
+  fields:
+    days:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 14
+          unit_of_measurement: days
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: rainbird_scheduler

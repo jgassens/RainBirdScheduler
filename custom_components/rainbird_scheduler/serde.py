@@ -18,7 +18,14 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
 from functools import cache
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import (
+    Any,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+    overload,
+)
 
 _NONE_TYPE = type(None)
 
@@ -60,6 +67,14 @@ def _dump_key(key: Any) -> str:
     if isinstance(key, Enum):
         return str(key.value)
     return str(key)
+
+
+@overload
+def load[T](target: type[T], data: Any) -> T: ...
+
+
+@overload
+def load(target: Any, data: Any) -> Any: ...
 
 
 def load(target: Any, data: Any) -> Any:

@@ -600,7 +600,9 @@ class ExecutionJournal:
     current_step_expected_end: datetime | None = None
     last_observation: ControllerObservation | None = None
     retry_count: int = 0
+    uncertain_count: int = 0
     stop_requested: bool = False
+    paused_reason: str | None = None
     completed_occurrences: dict[str, datetime] = field(default_factory=dict)
     updated_at_utc: datetime | None = None
 

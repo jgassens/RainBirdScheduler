@@ -28,6 +28,8 @@ ignore = [
     "E501",   # line length is enforced by the formatter
     "SIM105", # contextlib.suppress is not always clearer
 ]
+# Deliberate typography in user-facing strings and docstrings.
+allowed-confusables = ["×", "–"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["custom_components.rainbird_scheduler"]
@@ -35,7 +37,9 @@ combine-as-imports = true
 
 [tool.mypy]
 python_version = "3.13"
-packages = ["custom_components.rainbird_scheduler"]
+files = ["custom_components/rainbird_scheduler"]
+# The bundled frontend/ asset directory must not shadow frontend.py.
+namespace_packages = false
 check_untyped_defs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
@@ -46,11 +50,6 @@ warn_return_any = true
 show_error_codes = true
 follow_imports = "silent"
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "tests.*"
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

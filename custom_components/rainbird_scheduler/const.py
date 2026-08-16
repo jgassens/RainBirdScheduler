@@ -45,6 +45,10 @@ DEFAULT_MISSED_RUN_TOLERANCE_MINUTES = 30
 COMMAND_RETRY_DELAYS_SECONDS = (2, 5, 10, 20)
 MAX_COMMAND_ATTEMPTS = len(COMMAND_RETRY_DELAYS_SECONDS) + 1
 
+# Evidence newer than this counts as fresh when contradicting the commanded
+# clock (the core integration polls valve state every minute).
+OBSERVATION_FRESHNESS_WINDOW_SECONDS = 90
+
 # The Rain Bird public action accepts integer minutes in this range.
 MIN_COMMAND_MINUTES = 1
 MAX_COMMAND_MINUTES = 1440

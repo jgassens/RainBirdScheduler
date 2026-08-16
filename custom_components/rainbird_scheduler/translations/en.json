@@ -1,0 +1,142 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Choose a Rain Bird controller",
+        "description": "Pick the Rain Bird controller this scheduler will drive. The scheduler uses the core Rain Bird integration's entities and never opens its own connection.",
+        "data": {
+          "source": "Rain Bird controller"
+        }
+      },
+      "authority": {
+        "title": "Schedule authority",
+        "description": "Decide who owns automatic watering. In 'Home Assistant authoritative' mode you should disable native Rain Bird programs (or set their runtimes to zero) yourself — this integration never rewrites native schedules. Native Rain Bird schedules and Home Assistant schedules can conflict if both are active.",
+        "data": {
+          "authority_mode": "Authority mode",
+          "acknowledge_conflict": "I understand that native Rain Bird schedules and Home Assistant schedules can conflict"
+        }
+      }
+    },
+    "error": {
+      "acknowledge_required": "You must acknowledge the schedule-conflict warning to continue."
+    },
+    "abort": {
+      "no_controllers": "No unclaimed Rain Bird controllers were found. Set up the core Rain Bird integration first, or remove the existing scheduler for this controller.",
+      "already_configured": "This Rain Bird controller already has a scheduler."
+    }
+  },
+  "selector": {
+    "authority_mode": {
+      "options": {
+        "ha_authoritative": "Home Assistant authoritative (recommended)",
+        "native_authoritative": "Native Rain Bird authoritative",
+        "coexistence": "Coexistence (advanced)"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "next_irrigation": { "name": "Next irrigation" },
+      "active_zone": { "name": "Active zone" },
+      "expected_end": { "name": "Expected end" },
+      "seasonal_adjustment": { "name": "Seasonal adjustment" },
+      "last_run": { "name": "Last run" }
+    },
+    "binary_sensor": {
+      "scheduler_running": { "name": "Scheduler running" },
+      "native_schedule_conflict": { "name": "Native schedule conflict" },
+      "external_watering": { "name": "External watering" }
+    },
+    "switch": {
+      "scheduler_enabled": { "name": "Scheduler enabled" }
+    },
+    "button": {
+      "stop_controller": { "name": "Stop controller" }
+    },
+    "event": {
+      "irrigation_lifecycle": { "name": "Irrigation lifecycle" }
+    },
+    "calendar": {
+      "irrigation_plan": { "name": "Irrigation plan" }
+    }
+  },
+  "issues": {
+    "missing_source": {
+      "title": "Rain Bird controller missing for {title}",
+      "description": "The Rain Bird config entry this scheduler was bound to no longer exists. Programs and history are preserved. Re-add the Rain Bird integration for this controller, then reload the scheduler entry."
+    },
+    "zone_unresolved": {
+      "title": "Irrigation zone cannot be resolved: {zone}",
+      "description": "The zone's source entity failed validation and the scheduler refuses to water it: {error}. Check that the Rain Bird integration still provides this zone and that it was not replaced by a different controller."
+    }
+  },
+  "services": {
+    "run_program": {
+      "name": "Run program",
+      "description": "Start a scheduler program now as a manual run.",
+      "fields": {
+        "program_id": { "name": "Program", "description": "The program id to run." },
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    },
+    "run_zones": {
+      "name": "Run zones",
+      "description": "Run an ordered list of zones for explicit durations. All zones must belong to one Rain Bird controller; the scheduler serializes them one at a time.",
+      "fields": {
+        "zones": { "name": "Zones", "description": "Ordered list of {entity_id, duration} items (duration in whole minutes, 1-1440)." }
+      }
+    },
+    "stop_controller": {
+      "name": "Stop controller",
+      "description": "Stop ALL watering on the controller (Rain Bird has no per-zone stop).",
+      "fields": {
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    },
+    "pause": {
+      "name": "Pause run",
+      "description": "Stop the controller but keep the active run resumable.",
+      "fields": {
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    },
+    "resume": {
+      "name": "Resume run",
+      "description": "Resume a paused run if it is still within the missed-run tolerance.",
+      "fields": {
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    },
+    "skip_current": {
+      "name": "Skip current zone",
+      "description": "Stop the current zone (controller-wide stop) and continue with the next step.",
+      "fields": {
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    },
+    "recalculate": {
+      "name": "Recalculate plan",
+      "description": "Recompile the upcoming irrigation timeline.",
+      "fields": {
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    },
+    "set_program_enabled": {
+      "name": "Enable/disable program",
+      "description": "Enable or disable a scheduler program.",
+      "fields": {
+        "program_id": { "name": "Program", "description": "The program id." },
+        "enabled": { "name": "Enabled", "description": "Whether the program is enabled." },
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    },
+    "set_rain_delay": {
+      "name": "Set rain delay",
+      "description": "Set the native Rain Bird rain delay in DAYS. It suppresses native automatic programs but does not itself block manual zone runs; the scheduler separately honors it per program rain policy.",
+      "fields": {
+        "days": { "name": "Days", "description": "Rain delay in days (0 clears it)." },
+        "config_entry_id": { "name": "Scheduler entry", "description": "Scheduler config entry id (optional when only one exists)." }
+      }
+    }
+  }
+}

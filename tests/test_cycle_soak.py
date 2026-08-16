@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from itertools import pairwise
 
-from hypothesis import given, settings
-from hypothesis import strategies as st
+from hypothesis import given, settings, strategies as st
 
 from custom_components.rainbird_scheduler.planner import compile_timeline
 
@@ -43,7 +43,7 @@ def test_cycle_split_and_soak_spacing_single_zone() -> None:
     assert [step.cycle_index for step in steps] == [1, 2, 3]
     assert all(step.cycle_count == 3 for step in steps)
     # Soak: each later cycle starts >= previous end + 10 minutes.
-    for earlier, later in zip(steps, steps[1:], strict=False):
+    for earlier, later in pairwise(steps):
         assert later.planned_start_utc >= earlier.planned_end_utc + timedelta(
             minutes=10
         )
@@ -163,7 +163,7 @@ def test_compiled_timeline_invariants(specs) -> None:
     )
     zone_profiles = {zone.id: zone for zone in zones}
 
-    for earlier, later in zip(steps, steps[1:], strict=False):
+    for earlier, later in pairwise(steps):
         # No two compiled steps overlap; the inter-zone gap is respected.
         assert later.planned_start_utc >= earlier.planned_end_utc + GAP
 
@@ -186,7 +186,7 @@ def test_compiled_timeline_invariants(specs) -> None:
             quantize_zone_minutes(zone.base_runtime_minutes)
         )
         soak = timedelta(minutes=zone.minimum_soak_minutes or 0)
-        for earlier, later in zip(zone_steps, zone_steps[1:], strict=False):
+        for earlier, later in pairwise(zone_steps):
             # No cycle begins before its minimum soak interval.
             assert later.planned_start_utc >= earlier.planned_end_utc + soak
 

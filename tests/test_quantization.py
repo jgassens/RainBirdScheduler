@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from hypothesis import given
-from hypothesis import strategies as st
+from hypothesis import given, strategies as st
 
 from custom_components.rainbird_scheduler.planner import (
     allocate_cycles,

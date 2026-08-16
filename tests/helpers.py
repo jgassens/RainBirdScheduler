@@ -23,30 +23,30 @@ TZ = ZoneInfo("America/Chicago")
 
 
 def make_controller(**overrides) -> ControllerConfig:
-    defaults = dict(
-        id="controller-1",
-        revision=1,
-        source_config_entry_id="source-entry",
-        source_unique_id="aa:bb:cc:dd:ee:ff",
-    )
+    defaults = {
+        "id": "controller-1",
+        "revision": 1,
+        "source_config_entry_id": "source-entry",
+        "source_unique_id": "aa:bb:cc:dd:ee:ff",
+    }
     defaults.update(overrides)
     return ControllerConfig(**defaults)
 
 
 def make_zone(zone_id: str, station: int, **overrides) -> ZoneProfile:
-    defaults = dict(
-        id=zone_id,
-        revision=1,
-        reference=ZoneReference(
+    defaults = {
+        "id": zone_id,
+        "revision": 1,
+        "reference": ZoneReference(
             source_unique_id=f"aabbcc-{station}",
             source_config_entry_id="source-entry",
             entity_registry_id=f"reg-{zone_id}",
             station_number=station,
             last_known_entity_id=f"switch.zone_{station}",
         ),
-        display_name=zone_id.replace("-", " ").title(),
-        base_runtime_minutes=Decimal(10),
-    )
+        "display_name": zone_id.replace("-", " ").title(),
+        "base_runtime_minutes": Decimal(10),
+    }
     defaults.update(overrides)
     return ZoneProfile(**defaults)
 
@@ -57,20 +57,20 @@ def make_program(
     start: time = time(9, 0),
     **overrides,
 ) -> Program:
-    defaults = dict(
-        id=program_id,
-        revision=1,
-        name=program_id.replace("-", " ").title(),
-        recurrence=RecurrenceRule(
+    defaults = {
+        "id": program_id,
+        "revision": 1,
+        "name": program_id.replace("-", " ").title(),
+        "recurrence": RecurrenceRule(
             kind=RecurrenceKind.WEEKLY,
             weekdays=frozenset(range(7)),
         ),
-        nominal_start_times=[start],
-        zone_steps=[
+        "nominal_start_times": [start],
+        "zone_steps": [
             ProgramZoneStep(zone_id=zone_id, position=index)
             for index, zone_id in enumerate(zone_ids)
         ],
-    )
+    }
     defaults.update(overrides)
     return Program(**defaults)
 
