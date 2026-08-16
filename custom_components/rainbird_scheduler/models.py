@@ -127,6 +127,7 @@ class ProviderKind(StrEnum):
     FIXED = "fixed"
     MANUAL_PERCENT = "manual_percent"
     MONTHLY_CURVE = "monthly_curve"
+    SEASONAL_AUTO = "seasonal_auto"
     ENTITY_PERCENT = "entity_percent"
     ENTITY_RUNTIME = "entity_runtime"
 

@@ -287,3 +287,37 @@ def test_durations_are_valid_controller_commands() -> None:
     )
     for step in timeline.runs[0].steps:
         assert 1 <= step.duration_minutes <= 1440
+
+
+def test_all_zones_skipped_emits_cancellation_warning() -> None:
+    zones = [
+        make_zone("off-a", 1, base_runtime_minutes=Decimal(0)),
+        make_zone("off-b", 2, base_runtime_minutes=Decimal(0)),
+    ]
+    program = make_program("p", ["off-a", "off-b"])
+    occurrence = make_occurrence(program, NINE_AM)
+    timeline = compile_timeline(
+        make_input(make_controller(), [program], zones, [occurrence])
+    )
+    assert len(timeline.warnings) == 1
+    warning = timeline.warnings[0]
+    assert warning.occurrence_id == occurrence.occurrence_id
+    assert warning.program_id == program.id
+    assert "will not water" in warning.message
+    assert "all 2 zone(s) skipped" in warning.message
+    assert "below_resolution" in warning.message
+
+
+def test_partial_skip_does_not_warn_of_cancellation() -> None:
+    zones = [
+        make_zone("on", 1, base_runtime_minutes=Decimal(10)),
+        make_zone("off", 2, base_runtime_minutes=Decimal(0)),
+    ]
+    program = make_program("p", ["on", "off"])
+    occurrence = make_occurrence(program, NINE_AM)
+    timeline = compile_timeline(
+        make_input(make_controller(), [program], zones, [occurrence])
+    )
+    assert timeline.warnings == ()
+    assert len(timeline.runs[0].steps) == 1
+    assert timeline.runs[0].skipped_zones[0].zone_id == "off"

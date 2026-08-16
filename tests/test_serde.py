@@ -6,6 +6,8 @@ import json
 from datetime import UTC, datetime, time
 from decimal import Decimal
 
+import pytest
+
 from custom_components.rainbird_scheduler import serde
 from custom_components.rainbird_scheduler.models import (
     AdjustmentResult,
@@ -19,6 +21,7 @@ from custom_components.rainbird_scheduler.models import (
     HistoryData,
     ObservationFreshness,
     PendingCommand,
+    ProgramZoneStep,
     ProviderKind,
     RunOutcome,
     RunPlan,
@@ -27,6 +30,7 @@ from custom_components.rainbird_scheduler.models import (
     StepResult,
     StepStatus,
     WateringWindow,
+    ZoneProfile,
 )
 
 from .helpers import make_controller, make_program, make_zone
@@ -151,6 +155,36 @@ def test_history_roundtrip() -> None:
         ]
     )
     assert roundtrip(history, HistoryData) == history
+
+
+def test_null_rejected_for_non_optional_decimal_field() -> None:
+    data = serde.dump(make_zone("zone-a", 1))
+    data["base_runtime_minutes"] = None
+    with pytest.raises(ValueError, match="base_runtime_minutes"):
+        serde.load(ZoneProfile, data)
+
+
+def test_null_rejected_for_non_optional_int_field() -> None:
+    data = serde.dump(ProgramZoneStep(zone_id="zone-a", position=0))
+    data["requested_offset_seconds"] = None
+    with pytest.raises(ValueError, match="requested_offset_seconds"):
+        serde.load(ProgramZoneStep, data)
+
+
+def test_null_rejected_for_bare_target() -> None:
+    with pytest.raises(ValueError):
+        serde.load(Decimal, None)
+    with pytest.raises(ValueError):
+        serde.load(int, None)
+
+
+def test_null_still_valid_for_optional_fields() -> None:
+    data = serde.dump(make_zone("zone-a", 1))
+    data["max_cycle_minutes"] = None
+    data["precipitation_rate_mm_per_hour"] = None
+    loaded = serde.load(ZoneProfile, data)
+    assert loaded.max_cycle_minutes is None
+    assert loaded.precipitation_rate_mm_per_hour is None
 
 
 def test_dedup_window_is_bounded() -> None:

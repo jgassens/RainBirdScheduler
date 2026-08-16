@@ -491,6 +491,10 @@ class SchedulerCoordinator:
             get_state=self.hass.states.get,
             now_fn=dt_util.utcnow,
             get_zone=self.config.zones.get,
+            location=(
+                self.hass.config.latitude,
+                self.hass.config.longitude,
+            ),
         )
         per_zone = {}
         for step in program.zone_steps:
@@ -845,7 +849,12 @@ class SchedulerCoordinator:
         for key, raw in patch.items():
             if key in ("id", "revision") or key not in hints:
                 raise HomeAssistantError(f"Field not patchable: {key}")
-            updates[key] = serde.load(hints[key], raw)
+            try:
+                updates[key] = serde.load(hints[key], raw)
+            except ValueError as err:
+                raise ValueError(
+                    f"Invalid value for field {key!r}: {err}"
+                ) from err
         return dataclasses.replace(target, **updates)
 
     async def async_update_controller(

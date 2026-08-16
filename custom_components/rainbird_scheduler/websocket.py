@@ -196,7 +196,11 @@ async def ws_config_update(
 ) -> None:
     patch = msg["patch"]
     if "authority_mode" in patch:
-        new_mode = AuthorityMode(patch["authority_mode"])
+        try:
+            new_mode = AuthorityMode(patch["authority_mode"])
+        except ValueError as err:
+            connection.send_error(msg["id"], "invalid_config", str(err))
+            return
         if (
             new_mode is not coordinator.config.controller.authority_mode
             and not msg["acknowledge_authority_change"]
@@ -208,9 +212,13 @@ async def ws_config_update(
                 "acknowledge_authority_change: true",
             )
             return
-    updated = await coordinator.async_update_controller(
-        patch, msg["expected_revision"]
-    )
+    try:
+        updated = await coordinator.async_update_controller(
+            patch, msg["expected_revision"]
+        )
+    except (TypeError, ValueError, KeyError) as err:
+        connection.send_error(msg["id"], "invalid_config", str(err))
+        return
     connection.send_result(msg["id"], {"controller": serde.dump(updated)})
 
 

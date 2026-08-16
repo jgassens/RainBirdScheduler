@@ -96,7 +96,10 @@ def load(target: Any, data: Any) -> Any:
         return None
 
     if data is None:
-        return None
+        raise ValueError(
+            f"None is not valid for non-optional "
+            f"{getattr(target, '__name__', target)!r}"
+        )
 
     if origin in (list, set, frozenset):
         (item_type,) = get_args(target) or (Any,)
@@ -122,7 +125,14 @@ def load(target: Any, data: Any) -> Any:
             kwargs: dict[str, Any] = {}
             for field in dataclasses.fields(target):
                 if field.name in data:
-                    kwargs[field.name] = load(hints[field.name], data[field.name])
+                    try:
+                        kwargs[field.name] = load(
+                            hints[field.name], data[field.name]
+                        )
+                    except ValueError as err:
+                        raise ValueError(
+                            f"{target.__name__}.{field.name}: {err}"
+                        ) from err
                 elif (
                     field.default is dataclasses.MISSING
                     and field.default_factory is dataclasses.MISSING

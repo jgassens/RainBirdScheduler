@@ -50,6 +50,7 @@ const RECURRENCE_KINDS = [
 
 const PROVIDER_KINDS = [
   ["fixed", "Fixed 100%"],
+  ["seasonal_auto", "Automatic seasonal (nearest US city)"],
   ["manual_percent", "Manual percentage"],
   ["monthly_curve", "Monthly seasonal curve"],
   ["entity_percent", "External percentage entity"],
@@ -71,6 +72,23 @@ const WINDOW_POLICIES = [
 
 const SOILS = ["unknown", "clay", "loam", "sand"];
 const SLOPES = ["flat", "moderate", "steep"];
+
+/* Editable Cycle+Soak starting points, keyed "soil|slope" (plan §16: soil and
+ * slope populate SUGGESTIONS, never invisible behavior). Values follow the
+ * Texas A&M AgriLife Extension runoff guide (AGEN-PU-217): spray-head basis,
+ * clay = short cycles + ≥60 min soak, lighter soils = longer cycles + 30–40
+ * min soak, steeper slope = shorter cycle. Sand on flat ground rarely needs
+ * cycling at all, so it deliberately has no suggestion. */
+const CYCLE_SOAK_SUGGESTIONS = {
+  "clay|flat": { cycle: 6, soak: 60 },
+  "clay|moderate": { cycle: 4, soak: 60 },
+  "clay|steep": { cycle: 3, soak: 60 },
+  "loam|flat": { cycle: 12, soak: 40 },
+  "loam|moderate": { cycle: 9, soak: 40 },
+  "loam|steep": { cycle: 7, soak: 40 },
+  "sand|moderate": { cycle: 15, soak: 30 },
+  "sand|steep": { cycle: 10, soak: 30 },
+};
 const MIN_RUNTIME = [
   ["", "Controller default"],
   ["skip_with_warning", "Skip with warning"],
@@ -95,6 +113,198 @@ function recurrenceSummary(program) {
     .join(", ");
   return `${base} at ${starts || "—"}`;
 }
+
+/* Per-tab explainers. Every page opens with a concrete scenario, then defines
+ * each control on that page. Static authored HTML — no user data inside. */
+const HELP = {
+  overview: `
+    <p class="scen">Say Jonny opens this page at 8:55 AM. His "Morning Lawn"
+    program is about to fire: the cards tell him what the scheduler is doing
+    right now, and the table below shows exactly what it intends to do next.</p>
+    <p><b class="k">Scheduler card</b> — the executor state machine:
+    <i>idle</i> (nothing to do), <i>waiting</i> (a run is compiled and waiting
+    for its start time), <i>starting/watering/inter_zone_gap</i> (actively
+    driving the controller), <i>paused_*</i> (holding, with the reason shown),
+    <i>reconciling</i> (checking what the controller actually did after a
+    restart or an uncertain command).</p>
+    <p><b class="k">Requested vs planned</b> — "Requested" is the start time
+    you asked for. "Planned" is what the compiler produced after serializing
+    zones one-at-a-time, adding inter-zone gaps, and applying policies. If
+    three zones all request 9:00, only the first is planned at 9:00 — the
+    others are planned to follow it. The panel never blurs the two.</p>
+    <p><b class="k">Runtime column</b> — the whole-minute value actually sent
+    to the controller, with the exact pre-quantization figure beside it
+    (e.g. "14 min (14.4 exact)").</p>
+    <p><b class="k">Buttons</b> — <i>Stop controller</i> halts ALL watering
+    (even a run started from the Rain Bird app). <i>Pause</i> stops the
+    controller but keeps the run resumable; <i>Resume</i> continues from the
+    interrupted zone with remaining minutes recomputed. <i>Skip current zone</i>
+    ends the active zone and moves to the next planned step.
+    <i>Recalculate</i> recompiles the preview from current inputs.</p>
+    <p><b class="k">Status flags</b> — <i>external watering</i> means the
+    controller reports a zone on that this scheduler did not start (someone
+    used the app or the dial). <i>native schedule conflict</i> means the
+    controller's own onboard program is also active — two schedulers fighting
+    over one valve stack. <i>source unavailable</i> means the core rainbird
+    integration's entities are unavailable, so the scheduler cannot observe or
+    command anything.</p>`,
+
+  programs: `
+    <p class="scen">Say Jonny wants the lawn watered Monday, Wednesday and
+    Saturday at 6 AM, but the vegetable garden every 2nd day at 7 PM. That is
+    two programs: each card here is one program — its own days, start times,
+    zone list and policies.</p>
+    <p><b class="k">Priority</b> — when two programs' plans collide on the
+    clock, the lower number runs first and the other is shifted to follow it.</p>
+    <p><b class="k">Run now</b> — starts a manual occurrence of the program
+    immediately (it still respects rain policies and shows up in History
+    tagged "manual"). <b class="k">Disable</b> keeps the program but stops
+    scheduling it. <b class="k">Duplicate</b> copies it disabled, so you can
+    experiment safely. <b class="k">Delete</b> is permanent.</p>
+    <p>The order zones water in comes from the program's own zone list — edit
+    a program to change order, per-zone runtimes and policies.</p>`,
+
+  editor: `
+    <p class="scen">Say Jonny is building "Morning Lawn": Mon/Wed/Sat, one
+    6:00 AM start, three zones at 12, 8 and 15 minutes. Everything on this
+    page describes <i>intent</i> — the compiler turns it into a strict
+    one-zone-at-a-time plan you can preview on the Overview tab.</p>
+    <p><b class="k">Priority</b> — tie-breaker against other programs; lower
+    runs first when plans collide.</p>
+    <p><b class="k">Recurrence</b> — <i>Selected weekdays</i>,
+    <i>odd/even calendar days</i> (classic water-restriction schedules), or
+    <i>every N days</i> anchored to a date so the rhythm survives restarts.
+    Optional start/end dates bound the season. The DST rule decides what
+    happens if a start time lands in a nonexistent hour on spring-forward
+    night: shift to the first valid instant, or skip that one start.</p>
+    <p><b class="k">Start times</b> — the whole zone list runs once per start
+    time. Two starts = the full program twice that day.</p>
+    <p><b class="k">Zone rows</b> — <i>Order</i> is the watering sequence
+    (one zone at a time, always). <i>Runtime override</i> replaces the zone's
+    default base minutes just for this program. <i>Offset</i> shifts this
+    zone's requested start by N seconds relative to the program's start time.
+    <i>Max cycle / Min soak</i> override the zone's Cycle+Soak defaults from
+    the Zones tab (blank = use the zone's own values).</p>
+    <p><b class="k">Runtime adjustment</b> — scales every zone's base minutes
+    before compiling: <i>Fixed 100%</i> (no change), <i>Automatic seasonal</i>
+    (a per-month percent-of-peak curve chosen automatically from the major US
+    city nearest your Home Assistant home location — zero configuration),
+    <i>Manual %</i>, <i>Monthly curve</i> (per-month percentages you edit
+    yourself), <i>External % entity</i> (a sensor supplies the percentage), or
+    <i>External runtime entity</i> (a sensor supplies absolute minutes). Every
+    run's math is shown, input by input, on the Adjustments tab.</p>
+    <p><b class="k">Rain policy</b> — <i>Honor native rain delay</i>: if the
+    controller's own rain delay (in DAYS) is set, the scheduler skips —
+    important because Rain Bird controllers ignore their own delay for
+    manual/app runs, and this scheduler's runs are exactly that kind.
+    <i>Skip when sensor wet</i>: don't start while the rain sensor reports
+    wet. <i>On sensor cut</i> (sensor goes wet mid-run): <i>Abort</i> ends the
+    run, <i>Pause until dry</i> holds and resumes when the sensor dries,
+    <i>Defer remaining</i> abandons the rest but records it as deferred.</p>
+    <p><b class="k">Missed run</b> — if HA was down at start time:
+    <i>Run late</i> starts anyway if still within the tolerance window
+    (30 min by default), <i>Skip</i> records a skip.</p>
+    <p><b class="k">External interruption</b> — someone stops the controller
+    or starts an app run mid-plan: <i>Pause and resume</i> waits out the
+    conflict and continues; <i>Abort</i> ends the run with that outcome.</p>
+    <p><b class="k">Watering window</b> — hard bounds on when steps may START.
+    If a compiled step would fall outside: <i>Skip that step</i>,
+    <i>Truncate the last step</i> to fit, <i>Defer the whole occurrence</i>,
+    or <i>Require intervention</i> (mark a conflict and wait for you).</p>`,
+
+  zones: `
+    <p class="scen">Say Jonny's "West Yard" sits on a steep clay bank. It
+    needs 24 minutes of water, but after ~3 minutes of spray the clay stops
+    absorbing and water sheets downhill. The fix is Cycle+Soak: water in
+    short bursts, rest between them — and that is what most of this table
+    configures.</p>
+    <p><b class="k">Base (min)</b> — minutes this zone needs per run in
+    ideal conditions, before any adjustment provider scales it. Decimals are
+    fine here; the total is quantized to whole minutes (round half up) once,
+    when a plan is compiled.</p>
+    <p><b class="k">Soil / Slope</b> — picking a combination fills
+    <b class="k">Max cycle</b> and <b class="k">Min soak</b> with published
+    starting points (Texas A&amp;M AgriLife Extension runoff guidance,
+    AGEN-PU-217): clay = short cycles with a 60-minute soak, loam ≈ 9–12 min
+    cycles with 40-minute soaks, sand barely needs cycling; steeper slope
+    always shortens the cycle. The numbers land in the editable boxes and
+    save ONLY when you press Save — nothing changes invisibly. Those figures
+    assume spray heads; low-precipitation rotor zones can run roughly 3×
+    longer before runoff, so raise them if that is what the zone uses.</p>
+    <p><b class="k">Max cycle</b> — longest single burst allowed. Jonny's 24
+    minutes with a 3-minute max compiles to 8 bursts of 3. <b class="k">Min
+    soak</b> — the mandatory rest after each burst before the SAME zone may
+    water again. Other zones are free to run inside that gap; the planner
+    interleaves them. Blank both for one continuous run.</p>
+    <p><b class="k">Sub-minute policy</b> — what to do when adjustment shrinks
+    a runtime below the controller's 1-minute resolution (e.g. 1 min × 40% =
+    0.4): <i>Skip with warning</i>, <i>Clamp to one minute</i> (slightly
+    overwater instead of skipping), or <i>Carry forward</i> (bank the deficit
+    and add it to the next run). <i>Controller default</i> defers to the
+    global setting.</p>
+    <p><b class="k">On</b> — an off zone is excluded from every program with
+    a structured "zone disabled" skip reason, but keeps its configuration.</p>`,
+
+  adjustments: `
+    <p class="scen">Say Jonny set a monthly curve that waters 60% in October.
+    West Yard's base is 24 min, so the math is 24 × 60% = 14.4 exact →
+    commanded 14. This page shows that arithmetic for every zone of every
+    upcoming run — no black box, every input timestamped.</p>
+    <p><b class="k">Base</b> — the zone's configured minutes (or the
+    program's override). <b class="k">Factor</b> — the percentage the
+    provider produced for this run. <b class="k">Exact</b> — base × factor
+    before rounding. <b class="k">Commanded</b> — the whole minutes actually
+    sent (quantized once, round half up; Cycle+Soak splits happen AFTER this
+    total is fixed, so bursts always sum exactly to it).</p>
+    <p><b class="k">Inputs / stale</b> — entity-driven providers record which
+    entities they read and when. If an input hadn't updated recently, it is
+    flagged <i>stale</i> here and the provider falls back per its
+    configuration rather than silently trusting old data.</p>
+    <p>The explanation lines under each zone are the provider's own working —
+    the same provenance is stored with the run in History.</p>
+    <p>This page is deliberately <b class="k">read-only</b>: it shows the
+    arithmetic, it doesn't change it. To change how runtimes are adjusted,
+    edit the program (Programs tab → Edit → Runtime adjustment). Pick
+    <i>Automatic seasonal</i> there to have runtimes track the season using
+    the curve for the nearest major US city — no numbers to maintain.</p>`,
+
+  history: `
+    <p class="scen">Say the 6 AM run looked short this morning. Click the run
+    row: the zone detail shows planned vs actual start and end for every
+    burst, what was commanded, and a classified reason for anything odd.</p>
+    <p><b class="k">Outcomes</b> — <i>completed</i>;
+    <i>completed_with_skips</i> (finished, but some zones were skipped —
+    reasons in the detail); <i>aborted_*</i> (rain sensor cut, external stop,
+    your Stop button, power loss); <i>failed</i> (commands did not take).</p>
+    <p><b class="k">Requested vs actual start</b> — the gap between them is
+    normal serialization (zones queue one at a time) or a policy delay; large
+    gaps carry a reason.</p>
+    <p><b class="k">Retries / uncertain</b> — each controller command retries
+    with backoff; "uncertain" counts commands whose delivery could not be
+    confirmed (the connection dropped mid-command). The executor treats those
+    carefully on restart — it observes before re-commanding, so a zone is
+    never started twice.</p>
+    <p><b class="k">Failures &amp; interventions</b> — the bounded log of
+    everything that needed (or may need) a human: repeated command failures,
+    conflicts left in "require intervention" state, and similar.</p>
+    <p>This table is the authoritative record (a bounded store independent of
+    HA's recorder). The lifecycle <i>event entity</i> mirrors it for
+    automations and Logbook, but this page is the source of truth.</p>`,
+
+  diagnostics: `
+    <p class="scen">Filing a bug or checking why something planned oddly?
+    This JSON is the whole picture: config, compiled plan, executor state,
+    journal, and recent decisions — with secrets and tokens redacted, so it
+    is safe to paste into a GitHub issue.</p>
+    <p>The same payload is attached when you download diagnostics from the
+    integration page (Settings → Devices &amp; Services → Rain Bird
+    Scheduler). Notes at the top flag known oddities the integration itself
+    detected (stale sources, clock skew, journal recoveries).</p>`,
+};
+
+const helpBlock = (key, title) => `
+  <details class="help"><summary>How this page works — ${title}</summary>
+    <div>${HELP[key]}</div></details>`;
 
 class RainBirdSchedulerPanel extends HTMLElement {
   constructor() {
@@ -301,6 +511,10 @@ class RainBirdSchedulerPanel extends HTMLElement {
       .chip.off { background:#eee; color:#666; }
       .chip.bad { background:#ffcdd2; color:#b71c1c; }
       .chip.warn2 { background:#fff9c4; color:#795548; }
+      .banner.warn { background:#fff3e0; border-left:4px solid #ef6c00;
+        color:#5d4037; border-radius:8px; padding:10px 14px; margin:0 0 14px;
+        line-height:1.5; font-size:13px; }
+      .banner.warn b { color:#e65100; display:block; margin-bottom:4px; }
       .section { margin:22px 0 10px; font-size:16px; font-weight:500; }
       .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:6px 0;}
       label.f { display:flex; flex-direction:column; font-size:12px; gap:3px;
@@ -318,6 +532,20 @@ class RainBirdSchedulerPanel extends HTMLElement {
       pre { background:var(--card-background-color,#fff); padding:14px; border-radius:10px;
         overflow:auto; font-size:12px; box-shadow:var(--ha-card-box-shadow,0 1px 3px rgba(0,0,0,.12));}
       .explain { font-size:12px; color:var(--secondary-text-color,#666); margin:2px 0 8px 12px;}
+      .help { background:var(--card-background-color,#fff); border-radius:10px;
+        box-shadow:var(--ha-card-box-shadow,0 1px 3px rgba(0,0,0,.12));
+        margin:0 0 14px; font-size:13px; }
+      .help summary { cursor:pointer; padding:10px 14px; font-weight:500;
+        color:var(--primary-color,#03a9f4); user-select:none; }
+      .help > div { padding:0 16px 12px; line-height:1.55; max-width:760px; }
+      .help p { margin:7px 0; }
+      .help b.k { color:var(--primary-color,#0288d1); }
+      .help .scen { font-style:italic; color:var(--secondary-text-color,#666); }
+      .suggest-hint { font-size:12px; margin-top:8px; padding:8px 12px;
+        border-left:3px solid var(--primary-color,#03a9f4); border-radius:4px;
+        background:var(--secondary-background-color,#f0f7fa);
+        color:var(--primary-text-color,#212121); }
+      .suggest-hint:empty { display:none; }
       .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
       @media (max-width:800px){ .grid2 { grid-template-columns:1fr; } }
     `;
@@ -414,7 +642,54 @@ class RainBirdSchedulerPanel extends HTMLElement {
         ),
       ),
     );
+    root
+      .querySelectorAll('select[data-f="soil_type"], select[data-f="slope_class"]')
+      .forEach((select) =>
+        select.addEventListener("change", () =>
+          this._suggestCycleSoak(select.dataset.z),
+        ),
+      );
     if (this._draft) this._wireEditor();
+  }
+
+  /* Fill one zone row's Max cycle / Min soak inputs with the published
+   * starting point for its soil+slope. Direct DOM writes only — no re-render
+   * (that would discard other unsaved rows) and no save (Save persists). */
+  _suggestCycleSoak(zoneId) {
+    const root = this.shadowRoot;
+    const field = (name) =>
+      root.querySelector(`[data-z="${zoneId}"][data-f="${name}"]`);
+    const hint = root.getElementById("cycle-soak-hint");
+    const say = (message) => {
+      if (hint) hint.textContent = message;
+    };
+    const soil = field("soil_type")?.value;
+    const slope = field("slope_class")?.value;
+    const name =
+      this._config.zones[zoneId]?.display_name || `station ${zoneId}`;
+    if (!soil || soil === "unknown") {
+      say(`${name}: pick a soil type to get a Cycle+Soak starting point.`);
+      return;
+    }
+    const suggestion = CYCLE_SOAK_SUGGESTIONS[`${soil}|${slope}`];
+    if (!suggestion) {
+      say(
+        `${name}: sand on flat ground usually absorbs water as fast as ` +
+          `sprinklers apply it — Cycle+Soak is rarely needed. Leave Max ` +
+          `cycle and Min soak blank unless you actually see runoff.`,
+      );
+      return;
+    }
+    const cycleInput = field("max_cycle_minutes");
+    const soakInput = field("minimum_soak_minutes");
+    if (cycleInput) cycleInput.value = suggestion.cycle;
+    if (soakInput) soakInput.value = suggestion.soak;
+    say(
+      `${name}: suggested ${suggestion.cycle} min max cycle / ` +
+        `${suggestion.soak} min soak for ${soil} + ${slope} slope ` +
+        `(Texas A&M AgriLife spray-head guidance; rotor zones can run ~3× ` +
+        `longer). Adjust freely, then press Save on that row.`,
+    );
   }
 
   // ------------------------------------------------------------------
@@ -483,7 +758,22 @@ class RainBirdSchedulerPanel extends HTMLElement {
       )
       .join(" ");
 
+    const cancelled = (this._timeline?.warnings || [])
+      .map((warning) => `<div>⚠️ ${esc(warning.message)}</div>`)
+      .join("");
+
     return `
+      ${helpBlock("overview", "live state and the compiled plan")}
+      ${
+        cancelled
+          ? `<div class="banner warn">
+              <b>Scheduled watering will not happen</b>
+              ${cancelled}
+              <div class="sub">Skip reasons are listed under "Planned skips"
+                below; the per-zone math is on the Adjustments tab.</div>
+            </div>`
+          : ""
+      }
       <div class="cards">
         <div class="card"><h3>Scheduler</h3>
           <div class="big">${esc(state.executor_state)}</div>
@@ -599,6 +889,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
       })
       .join("");
     return `
+      ${helpBlock("programs", "programs are watering intent")}
       <div class="row" style="justify-content:flex-end">
         <button class="btn" data-action="new-program">New program</button>
       </div>
@@ -699,6 +990,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
     const window_ = draft.watering_window;
 
     return `
+      ${helpBlock("editor", "every field on this form")}
       <div class="card">
         <div class="row" style="justify-content:space-between">
           <b>${this._draftIsNew ? "New program" : `Edit: ${esc(draft.name)}`}</b>
@@ -768,6 +1060,11 @@ class RainBirdSchedulerPanel extends HTMLElement {
             Percent <input id="f-percent" type="number" min="0" max="300" value="${provider.percent ?? 100}"></label>
           <label class="f" id="f-entity-wrap" style="${provider.kind.startsWith("entity") ? "" : "display:none"}">
             Source entity <input id="f-entity" placeholder="sensor.example" value="${esc(provider.entity_id ?? "")}"></label>
+          <span class="sub" id="f-seasonal-hint" style="${provider.kind === "seasonal_auto" ? "" : "display:none"}">
+            Scales base runtimes by month using a published percent-of-peak
+            curve for the major US city nearest your Home Assistant home
+            location. Base runtime = peak-season minutes. The chosen city and
+            each month's percentage appear on the Adjustments tab.</span>
         </div>
         <div id="f-monthly-wrap" style="${provider.kind === "monthly_curve" ? "" : "display:none"}">
           <div class="row">${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -827,9 +1124,19 @@ class RainBirdSchedulerPanel extends HTMLElement {
       input.addEventListener("change", () => {
         const step = this._draft.zone_steps[Number(input.dataset.step)];
         const field = input.dataset.field;
+        // Override fields accept null (meaning "no override"); the rest
+        // are non-nullable ints on the backend, so a cleared input
+        // reverts to the current value instead of storing null.
+        const nullable = [
+          "base_runtime_override_minutes",
+          "max_cycle_minutes_override",
+          "minimum_soak_minutes_override",
+        ];
         if (input.type === "checkbox") step[field] = input.checked;
-        else if (input.value === "") step[field] = null;
-        else if (field === "zone_id") step[field] = input.value;
+        else if (input.value === "") {
+          if (nullable.includes(field)) step[field] = null;
+          else input.value = step[field];
+        } else if (field === "zone_id") step[field] = input.value;
         else if (field === "base_runtime_override_minutes")
           step[field] = String(input.value);
         else step[field] = Number(input.value);
@@ -993,34 +1300,47 @@ class RainBirdSchedulerPanel extends HTMLElement {
       )
       .join("");
     return `
-      <div class="sub" style="margin-bottom:8px">Soil and slope populate editable
-        Cycle+Soak suggestions; they never change behavior invisibly. Runtimes are
-        quantized once to whole minutes (round half up) when a plan is compiled.</div>
+      ${helpBlock("zones", "runtimes, soil and Cycle+Soak")}
+      <div class="sub" style="margin-bottom:8px">Changing Soil or Slope fills Max
+        cycle / Min soak with published starting points (Texas A&amp;M AgriLife
+        runoff guidance) — visible in the boxes, editable, and applied only when
+        you press Save. Runtimes are quantized once to whole minutes (round half
+        up) when a plan is compiled.</div>
       <table>
         <tr><th>Station</th><th>Name</th><th>Source entity</th><th>On</th>
           <th>Base (min)</th><th>Soil</th><th>Slope</th><th>Max cycle</th>
           <th>Min soak</th><th>Sub-minute policy</th><th></th></tr>
         ${rows || '<tr><td colspan="11" class="muted">No zones discovered</td></tr>'}
-      </table>`;
+      </table>
+      <div class="suggest-hint" id="cycle-soak-hint"></div>`;
   }
 
   async _saveZone(zoneId) {
     const zone = this._config.zones[zoneId];
     const root = this.shadowRoot;
     const patch = {};
-    root
-      .querySelectorAll(`[data-z="${zoneId}"]`)
-      .forEach((input) => {
-        const field = input.dataset.f;
-        if (input.type === "checkbox") patch[field] = input.checked;
-        else if (input.value === "" || input.value == null)
-          patch[field] = null;
-        else if (
-          ["max_cycle_minutes", "minimum_soak_minutes"].includes(field)
-        )
-          patch[field] = Number(input.value);
-        else patch[field] = String(input.value);
-      });
+    // Only these zone fields accept null on the backend; clearing any
+    // other input must not persist null (it would poison recalculation).
+    const nullable = [
+      "max_cycle_minutes",
+      "minimum_soak_minutes",
+      "minimum_runtime_policy",
+    ];
+    for (const input of root.querySelectorAll(`[data-z="${zoneId}"]`)) {
+      const field = input.dataset.f;
+      if (input.type === "checkbox") patch[field] = input.checked;
+      else if (input.value === "" || input.value == null) {
+        if (!nullable.includes(field)) {
+          this._toastMsg(`${field.replace(/_/g, " ")} cannot be empty.`);
+          return;
+        }
+        patch[field] = null;
+      } else if (
+        ["max_cycle_minutes", "minimum_soak_minutes"].includes(field)
+      )
+        patch[field] = Number(input.value);
+      else patch[field] = String(input.value);
+    }
     if (patch.minimum_runtime_policy === "") patch.minimum_runtime_policy = null;
     await this._action(
       this.api({
@@ -1042,7 +1362,8 @@ class RainBirdSchedulerPanel extends HTMLElement {
   _renderAdjustments() {
     const runs = this._timeline?.runs || [];
     if (!runs.length)
-      return '<div class="card muted">No upcoming runs to explain.</div>';
+      return `${helpBlock("adjustments", "the runtime math, shown in full")}
+        <div class="card muted">No upcoming runs to explain.</div>`;
     const blocks = runs.slice(0, 6).map((run) => {
       const snapshot = run.adjustment_snapshot || {};
       const zones = Object.entries(snapshot.per_zone || {})
@@ -1069,7 +1390,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
         <table><tr><th>Zone</th><th>Base</th><th>Factor</th><th>Exact</th>
           <th>Commanded</th><th>Inputs</th></tr>${zones}</table>`;
     });
-    return blocks.join("");
+    return helpBlock("adjustments", "the runtime math, shown in full") + blocks.join("");
   }
 
   // ------------------------------------------------------------------
@@ -1131,6 +1452,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
       )
       .join("");
     return `
+      ${helpBlock("history", "what actually happened, and why")}
       <div class="section">Runs (authoritative bounded history)</div>
       <table><tr><th>Requested</th><th>Actual start</th><th>Program</th>
         <th>Outcome</th><th>Reason</th><th>Retries</th></tr>${
@@ -1149,6 +1471,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
     if (!this._diagnostics)
       return '<div class="card muted">Loading diagnostics…</div>';
     return `
+      ${helpBlock("diagnostics", "the full redacted state dump")}
       <div class="sub" style="margin-bottom:8px">${(
         this._diagnostics.notes || []
       )
@@ -1323,4 +1646,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
   }
 }
 
-customElements.define("rainbird-scheduler-panel", RainBirdSchedulerPanel);
+/* A page that survives a cache-busted reload (HA restart with the panel open)
+ * would otherwise hit "name already used with this registry". */
+if (!customElements.get("rainbird-scheduler-panel"))
+  customElements.define("rainbird-scheduler-panel", RainBirdSchedulerPanel);

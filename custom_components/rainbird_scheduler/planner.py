@@ -230,10 +230,29 @@ def compile_timeline(inp: PlannerInput) -> CompiledControllerTimeline:
         )
         builds[occurrence.occurrence_id] = build
 
+        occurrence_items: list[_WorkItem] = []
         for step in sorted(program.zone_steps, key=lambda s: s.position):
             item = _build_work_item(inp, build, step)
             if item is not None:
-                work_items.append(item)
+                occurrence_items.append(item)
+        work_items.extend(occurrence_items)
+
+        if not occurrence_items and build.skipped:
+            reasons = sorted({skip.reason.value for skip in build.skipped})
+            local = occurrence.scheduled_start_local
+            warnings.append(
+                PlannerWarning(
+                    occurrence_id=occurrence.occurrence_id,
+                    program_id=program.id,
+                    zone_id=None,
+                    message=(
+                        f"Program {program.name!r} at "
+                        f"{local.strftime('%a %b %d %H:%M')} will not water: "
+                        f"all {len(build.skipped)} zone(s) skipped "
+                        f"({', '.join(reasons)})."
+                    ),
+                )
+            )
 
     _schedule(inp, work_items, builds, conflicts)
     _enforce_lateness(inp, builds, conflicts)

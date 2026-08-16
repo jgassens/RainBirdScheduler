@@ -183,6 +183,35 @@ async def test_zone_update_and_plan_preview(
     assert result["result"]["state"]["executor_state"] == "idle"
 
 
+async def test_zone_update_rejects_null_base_runtime(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+    zone_id = next(iter(coordinator.config.zones))
+    before = coordinator.config.zones[zone_id]
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/zone/update",
+            "entry_id": scheduler_entry.entry_id,
+            "zone_id": zone_id,
+            "expected_revision": before.revision,
+            "patch": {"base_runtime_minutes": None},
+        }
+    )
+    result = await client.receive_json()
+    assert not result["success"]
+    assert result["error"]["code"] == "invalid_zone"
+    assert "base_runtime_minutes" in result["error"]["message"]
+
+    # The zone is untouched: value, revision, and no null smuggled in.
+    after = coordinator.config.zones[zone_id]
+    assert after.base_runtime_minutes == before.base_runtime_minutes
+    assert after.revision == before.revision
+
+
 async def test_authority_change_requires_acknowledgment(
     hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
 ) -> None:
