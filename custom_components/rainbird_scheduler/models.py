@@ -361,6 +361,22 @@ class ProgramZoneStep:
     max_cycle_minutes_override: int | None = None
     minimum_soak_minutes_override: int | None = None
 
+    def __post_init__(self) -> None:
+        # A zero-minute override is never intent (the ``enabled`` flag is how
+        # a zone sits out a program) but number spinners produce 0 from a
+        # single click on an empty box. Normalize both overrides on every
+        # construction path — stored config included — to "no override".
+        if (
+            self.base_runtime_override_minutes is not None
+            and self.base_runtime_override_minutes == 0
+        ):
+            self.base_runtime_override_minutes = None
+        if (
+            self.max_cycle_minutes_override is not None
+            and self.max_cycle_minutes_override <= 0
+        ):
+            self.max_cycle_minutes_override = None
+
 
 @dataclass
 class Program:

@@ -1136,6 +1136,18 @@ class RainBirdSchedulerPanel extends HTMLElement {
         else if (input.value === "") {
           if (nullable.includes(field)) step[field] = null;
           else input.value = step[field];
+        } else if (
+          nullable.includes(field) &&
+          field !== "minimum_soak_minutes_override" &&
+          Number(input.value) === 0
+        ) {
+          // Spinner misclick: a 0-minute override waters nothing, and a 0
+          // max cycle means "no cycling" — both are really "no override".
+          step[field] = null;
+          input.value = "";
+          this._toastMsg(
+            "A 0 override would water nothing — cleared. Untick On to skip a zone.",
+          );
         } else if (field === "zone_id") step[field] = input.value;
         else if (field === "base_runtime_override_minutes")
           step[field] = String(input.value);
