@@ -197,3 +197,76 @@ def test_compiled_timeline_invariants(specs) -> None:
     for skipped in run.skipped_zones:
         assert skipped.reason is not None
         assert skipped.detail
+
+
+# ---------------------------------------------------------------------------
+# Executor honors compiled soak waits (regression: the second cycle of a
+# Cycle+Soak zone was commanded ~5s after the first ended, skipping the soak
+# and racing the next poll into a phantom "external stop" abort).
+# ---------------------------------------------------------------------------
+
+
+def soak_rig():
+    from .harness import build_rig
+    from .helpers import make_program, make_zone
+
+    zones = [
+        make_zone(
+            "garden",
+            1,
+            base_runtime_minutes=Decimal(10),
+            max_cycle_minutes=5,
+            minimum_soak_minutes=60,
+        )
+    ]
+    program = make_program("garden-cycles", ["garden"])
+    return build_rig(zones, program)
+
+
+async def test_second_cycle_waits_for_planned_soak_start() -> None:
+    from custom_components.rainbird_scheduler.models import (
+        ExecutorState,
+        RunOutcome,
+    )
+
+    rig = soak_rig()
+    steps = rig.plan.steps
+    assert len(steps) == 2
+    soak_wait = steps[1].planned_start_utc - steps[0].planned_end_utc
+    assert soak_wait >= timedelta(minutes=60)
+
+    await rig.executor.async_start_run(rig.plan)
+    assert len(rig.driver.start_calls) == 1
+
+    # Cycle 1 ends at its commanded end; the 5s inter-zone gap passes.
+    await rig.tm.advance(5 * 60)
+    assert rig.journal().state is ExecutorState.INTER_ZONE_GAP
+    await rig.tm.advance(5)
+
+    # Regression: cycle 2 must NOT have been commanded at the gap.
+    assert len(rig.driver.start_calls) == 1
+    assert rig.journal().state is ExecutorState.INTER_ZONE_GAP
+
+    # A poll showing the zone off mid-soak is normal, not an external stop.
+    await rig.zone_event("garden", False)
+    assert rig.journal().state is ExecutorState.INTER_ZONE_GAP
+    assert rig.history.finished == []
+
+    # One second before the planned start: still waiting.
+    remaining = (
+        steps[1].planned_start_utc - rig.tm.now - timedelta(seconds=1)
+    ).total_seconds()
+    await rig.tm.advance(remaining)
+    assert len(rig.driver.start_calls) == 1
+
+    # At the planned start the second cycle is commanded.
+    await rig.tm.advance(1)
+    assert len(rig.driver.start_calls) == 2
+    assert rig.tm.now == steps[1].planned_start_utc
+    assert rig.journal().state is ExecutorState.WATERING
+
+    # And the run completes normally.
+    await rig.tm.advance(6 * 60)
+    assert rig.history.finished == [
+        (rig.plan.run_id, RunOutcome.COMPLETED, None)
+    ]

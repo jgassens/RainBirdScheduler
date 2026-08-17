@@ -480,7 +480,20 @@ class RunExecutor:
                 )
             return
         journal.current_step_index = next_index
+        # No planned-start wait here: _advance is also the resume path
+        # after pauses and user skips, where the compiled times are stale
+        # and continuing immediately is the intent. The soak wait is
+        # enforced where steps complete on plan (_arm_gap_to_next_start).
         await self._start_step(next_index)
+
+    def _next_pending_index(self) -> int | None:
+        journal = self.journal
+        plan = self._plan()
+        for step in plan.steps:
+            result = journal.step_results.get(step.index)
+            if result is not None and result.status is StepStatus.PENDING:
+                return step.index
+        return None
 
     async def _start_step(self, index: int) -> None:
         journal = self.journal
@@ -687,7 +700,29 @@ class RunExecutor:
                 "cycle": f"{step.cycle_index}/{step.cycle_count}",
             },
         )
-        self._arm_in(self._config().inter_zone_gap_seconds, self._on_gap)
+        self._arm_gap_to_next_start()
+
+    def _arm_gap_to_next_start(self) -> None:
+        """Arm _on_gap at the gap end — or the planned start for soaks.
+
+        A step with ``soak_before`` must not start before its compiled
+        start time: that time carries the zone's minimum soak (§16), and
+        advancing at the bare gap would re-command a zone seconds after
+        the controller stopped it, skipping the soak and racing the next
+        observation into a phantom "external stop". Steps without a soak
+        keep the old behavior (start after the gap, even when the prior
+        zone finished early).
+        """
+        plan = self._plan()
+        target = self._now() + timedelta(
+            seconds=self._config().inter_zone_gap_seconds
+        )
+        next_index = self._next_pending_index()
+        if next_index is not None:
+            next_step = plan.steps[next_index]
+            if next_step.soak_before and next_step.planned_start_utc > target:
+                target = next_step.planned_start_utc
+        self._arm_at(target, self._on_gap)
 
     async def _on_expected_end(self) -> None:
         journal = self.journal
@@ -1227,7 +1262,9 @@ class RunExecutor:
             return
 
         if state is ExecutorState.INTER_ZONE_GAP:
-            self._arm_in(self._config().inter_zone_gap_seconds, self._on_gap)
+            # Re-arm through the soak-aware helper so a restart mid-soak
+            # does not fast-forward the remaining cycles.
+            self._arm_gap_to_next_start()
             return
 
     # ------------------------------------------------------------------
