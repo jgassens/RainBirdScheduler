@@ -23,12 +23,16 @@ _LOGGER = logging.getLogger(__name__)
 async def async_register_panel(hass: HomeAssistant) -> None:
     """Serve the bundled frontend and register one global panel."""
     frontend_dir = Path(__file__).parent / "frontend"
+    # The version lives in the PATH, not a query string: Safari serves
+    # cached ES modules for query-only changes, so each upgrade must produce
+    # a URL Safari has never seen.
+    static_url = f"{FRONTEND_STATIC_URL}/{INTEGRATION_VERSION}"
     await hass.http.async_register_static_paths(
         [
             StaticPathConfig(
-                FRONTEND_STATIC_URL,
+                static_url,
                 str(frontend_dir),
-                True,  # cache headers; the query hash below busts caches
+                True,  # long cache headers are safe on a versioned path
             )
         ]
     )
@@ -43,9 +47,7 @@ async def async_register_panel(hass: HomeAssistant) -> None:
                 "name": "rainbird-scheduler-panel",
                 "embed_iframe": False,
                 "trust_external": False,
-                "module_url": (
-                    f"{FRONTEND_STATIC_URL}/panel.js?v={INTEGRATION_VERSION}"
-                ),
+                "module_url": f"{static_url}/panel.js",
             }
         },
         require_admin=True,

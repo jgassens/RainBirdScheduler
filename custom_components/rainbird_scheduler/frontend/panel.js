@@ -49,12 +49,12 @@ const RECURRENCE_KINDS = [
 ];
 
 const PROVIDER_KINDS = [
-  ["fixed", "Fixed 100%"],
+  ["fixed", "No adjustment — always run base minutes"],
   ["seasonal_auto", "Automatic seasonal (nearest US city)"],
-  ["manual_percent", "Manual percentage"],
-  ["monthly_curve", "Monthly seasonal curve"],
-  ["entity_percent", "External percentage entity"],
-  ["entity_runtime", "External runtime entity"],
+  ["manual_percent", "Fixed percentage I type in (e.g. 50%)"],
+  ["monthly_curve", "Percentage per month I type in"],
+  ["entity_percent", "Percentage read from a sensor entity"],
+  ["entity_runtime", "Total minutes read from a sensor entity"],
 ];
 
 const SENSOR_CUT = [
@@ -192,13 +192,17 @@ const HELP = {
     <i>Max cycle / Min soak</i> override the zone's Cycle+Soak defaults from
     the Zones tab (blank = use the zone's own values).</p>
     <p><b class="k">Runtime adjustment</b> — scales every zone's base minutes
-    before compiling: <i>Fixed 100%</i> (no change), <i>Automatic seasonal</i>
-    (a per-month percent-of-peak curve chosen automatically from the major US
-    city nearest your Home Assistant home location — zero configuration),
-    <i>Manual %</i>, <i>Monthly curve</i> (per-month percentages you edit
-    yourself), <i>External % entity</i> (a sensor supplies the percentage), or
-    <i>External runtime entity</i> (a sensor supplies absolute minutes). Every
-    run's math is shown, input by input, on the Adjustments tab.</p>
+    before compiling. <i>No adjustment</i> always runs the base minutes.
+    <i>Automatic seasonal</i> picks a per-month percent-of-peak curve from the
+    major US city nearest your Home Assistant home location — zero
+    configuration. <i>Fixed percentage I type in</i> runs every zone at that
+    percent (50 → half the minutes, every run). <i>Percentage per month</i> is
+    twelve percentages you edit yourself. The two <i>read from a sensor
+    entity</i> options take an <b>entity ID</b> (like
+    <code>sensor.watering_percent</code>) — the sensor's live state supplies
+    the percentage or total minutes before each run; a plain number typed
+    there will not work. Every run's math is shown, input by input, on the
+    Adjustments tab.</p>
     <p><b class="k">Rain policy</b> — <i>Honor native rain delay</i>: if the
     controller's own rain delay (in DAYS) is set, the scheduler skips —
     important because Rain Bird controllers ignore their own delay for
@@ -1328,14 +1332,28 @@ class RainBirdSchedulerPanel extends HTMLElement {
                 `<option value="${value}" ${provider.kind === value ? "selected" : ""}>${label}</option>`,
             ).join("")}</select></label>
           <label class="f" id="f-percent-wrap" style="${provider.kind === "manual_percent" ? "" : "display:none"}">
-            Percent <input id="f-percent" type="number" min="0" max="300" value="${provider.percent ?? 100}"></label>
+            Percent of base runtime
+            <input id="f-percent" type="number" min="0" max="300" value="${provider.percent ?? 100}"></label>
           <label class="f" id="f-entity-wrap" style="${provider.kind.startsWith("entity") ? "" : "display:none"}">
-            Source entity <input id="f-entity" placeholder="sensor.example" value="${esc(provider.entity_id ?? "")}"></label>
-          <span class="sub" id="f-seasonal-hint" style="${provider.kind === "seasonal_auto" ? "" : "display:none"}">
-            Scales base runtimes by month using a published percent-of-peak
-            curve for the major US city nearest your Home Assistant home
-            location. Base runtime = peak-season minutes. The chosen city and
-            each month's percentage appear on the Adjustments tab.</span>
+            Entity ID (not a number)
+            <input id="f-entity" placeholder="sensor.example" value="${esc(provider.entity_id ?? "")}"></label>
+        </div>
+        <div class="sub" id="f-percent-hint" style="${provider.kind === "manual_percent" ? "" : "display:none"}">
+          Every zone runs at this percent of its base minutes on every run —
+          e.g. 50 turns a 10-minute zone into 5 minutes.
+        </div>
+        <div class="sub" id="f-entity-hint" style="${provider.kind.startsWith("entity") ? "" : "display:none"}">
+          This is the ID of a Home Assistant entity (like
+          <code>sensor.watering_percent</code>) whose live state supplies the
+          ${provider.kind === "entity_runtime" ? "total minutes" : "percentage"}
+          before each run. To use one fixed percentage instead, choose
+          "Fixed percentage I type in" above.
+        </div>
+        <div class="sub" id="f-seasonal-hint" style="${provider.kind === "seasonal_auto" ? "" : "display:none"}">
+          Scales base runtimes by month using a published percent-of-peak
+          curve for the major US city nearest your Home Assistant home
+          location. Base runtime = peak-season minutes. The chosen city and
+          each month's percentage appear on the Adjustments tab.
         </div>
         <div id="f-monthly-wrap" style="${provider.kind === "monthly_curve" ? "" : "display:none"}">
           <div class="row">${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -1516,6 +1534,21 @@ class RainBirdSchedulerPanel extends HTMLElement {
     if (!draft.zone_steps.length) {
       this._toastMsg("Add at least one zone.");
       return;
+    }
+    const provider = draft.adjustment_provider;
+    if (provider.kind?.startsWith("entity")) {
+      const entity = provider.entity_id || "";
+      if (!/^[a-z_]+\.[a-z0-9_]+$/i.test(entity)) {
+        this._toastMsg(
+          /^\d+(\.\d+)?$/.test(entity)
+            ? `"${entity}" is a number, but this provider reads a sensor — ` +
+              `it needs an entity ID like sensor.watering_percent. ` +
+              `For a fixed ${entity}%, pick "Fixed percentage I type in".`
+            : "This provider reads a sensor: enter an entity ID like " +
+              "sensor.watering_percent (or pick a different provider).",
+        );
+        return;
+      }
     }
     if (this._draftIsNew) {
       await this._action(
