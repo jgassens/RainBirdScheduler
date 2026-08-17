@@ -210,6 +210,13 @@ class SchedulerCoordinator:
         )
 
         await self.executor.async_recover()
+        # A run paused for a sensor/freeze condition that cleared while HA was
+        # down would otherwise wait for the next state-change event; nudge it
+        # with a fresh reading so it resumes (or expires) promptly.
+        if self.executor.journal.state is ExecutorState.PAUSED_SENSOR:
+            await self.executor.async_handle_weather_state(
+                self.build_observation()
+            )
         await self.async_recalculate()
 
     async def async_shutdown(self) -> None:
@@ -268,6 +275,7 @@ class SchedulerCoordinator:
         }
         self._entity_to_zone.clear()
         self._zone_to_entity.clear()
+        rain_sensor_candidates: list[er.RegistryEntry] = []
 
         for entry in entries:
             if entry.platform != SOURCE_DOMAIN:
@@ -276,11 +284,7 @@ class SchedulerCoordinator:
             if domain == "switch":
                 self._register_zone(entry, by_unique)
             elif domain == "binary_sensor":
-                self._rain_sensor_entity = entry.entity_id
-                self.config.controller.rain_sensor_reference = EntityReference(
-                    entity_registry_id=entry.id,
-                    last_known_entity_id=entry.entity_id,
-                )
+                rain_sensor_candidates.append(entry)
             elif domain == "number":
                 self._rain_delay_entity = entry.entity_id
                 self.config.controller.rain_delay_reference = EntityReference(
@@ -295,6 +299,28 @@ class SchedulerCoordinator:
                         last_known_entity_id=entry.entity_id,
                     )
                 )
+
+        if rain_sensor_candidates:
+            # Prefer the moisture-classed sensor (the rain sensor) over any
+            # other binary_sensor the source exposes; deterministic tie-break by
+            # entity id. This only sets the discovered reference — a user
+            # override lives in ``rain_sensor_override_entity_id`` and is never
+            # touched here, so it survives registry re-scans.
+            def _is_moisture(entry: er.RegistryEntry) -> bool:
+                return "moisture" in (
+                    entry.device_class,
+                    entry.original_device_class,
+                )
+
+            chosen = min(
+                rain_sensor_candidates,
+                key=lambda e: (not _is_moisture(e), e.entity_id),
+            )
+            self._rain_sensor_entity = chosen.entity_id
+            self.config.controller.rain_sensor_reference = EntityReference(
+                entity_registry_id=chosen.id,
+                last_known_entity_id=chosen.entity_id,
+            )
 
     def _register_zone(
         self, entry: er.RegistryEntry, by_unique: dict[str, ZoneProfile]
@@ -391,12 +417,26 @@ class SchedulerCoordinator:
     # Observations and event fan-in (plan §19, §27)
     # ------------------------------------------------------------------
 
+    def _effective_rain_sensor(self) -> str | None:
+        """User override wins over the auto-discovered rain sensor."""
+        return (
+            self.config.controller.rain_sensor_override_entity_id
+            or self._rain_sensor_entity
+        )
+
+    def _temperature_entity(self) -> str | None:
+        return self.config.controller.freeze_guard.temperature_entity_id
+
     def _subscribe_states(self) -> None:
         if self._unsub_state is not None:
             self._unsub_state()
         watched = list(self._entity_to_zone)
-        for extra in (self._rain_sensor_entity, self._rain_delay_entity):
-            if extra:
+        for extra in (
+            self._effective_rain_sensor(),
+            self._rain_delay_entity,
+            self._temperature_entity(),
+        ):
+            if extra and extra not in watched:
                 watched.append(extra)
         if not watched:
             self._unsub_state = None
@@ -411,8 +451,9 @@ class SchedulerCoordinator:
         observation = build_observation(
             self.hass,
             zone_entities=self._zone_to_entity,
-            rain_sensor_entity=self._rain_sensor_entity,
+            rain_sensor_entity=self._effective_rain_sensor(),
             rain_delay_entity=self._rain_delay_entity,
+            temperature_entity=self._temperature_entity(),
             now=dt_util.utcnow(),
         )
         self.last_observation = observation
@@ -429,8 +470,10 @@ class SchedulerCoordinator:
             await self.executor.async_handle_zone_state(
                 zone_id, is_on, observation
             )
-        elif entity_id == self._rain_sensor_entity:
+        elif entity_id == self._effective_rain_sensor():
             await self.executor.async_handle_sensor_state(observation)
+        elif entity_id == self._temperature_entity():
+            await self.executor.async_handle_weather_state(observation)
 
         self._refresh_flags(observation)
         self._notify_state()
@@ -868,6 +911,9 @@ class SchedulerCoordinator:
         )
         updated.revision = current.revision + 1
         self.config.controller = updated
+        # The temperature source or rain-sensor override may have changed;
+        # re-subscribe so the new entity is watched without a reload.
+        self._subscribe_states()
         await self._persist_config()
         return updated
 

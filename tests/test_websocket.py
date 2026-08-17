@@ -277,3 +277,72 @@ async def test_unknown_entry_rejected(
     result = await client.receive_json()
     assert not result["success"]
     assert result["error"]["code"] == "entry_not_found"
+
+
+async def test_config_update_patches_freeze_guard(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/config/update",
+            "entry_id": scheduler_entry.entry_id,
+            "expected_revision": 1,
+            "patch": {
+                "freeze_guard": {
+                    "enabled": True,
+                    "temperature_entity_id": "weather.home",
+                    "threshold": "2",
+                    "unit": "°C",
+                    "when_unavailable": "allow_watering",
+                }
+            },
+        }
+    )
+    result = await client.receive_json()
+    assert result["success"]
+    guard = result["result"]["controller"]["freeze_guard"]
+    assert guard["enabled"] is True
+    assert guard["temperature_entity_id"] == "weather.home"
+
+
+async def test_config_update_rejects_bare_number_entity(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/config/update",
+            "entry_id": scheduler_entry.entry_id,
+            "expected_revision": 1,
+            "patch": {
+                "freeze_guard": {
+                    "enabled": True,
+                    "temperature_entity_id": "50",
+                }
+            },
+        }
+    )
+    result = await client.receive_json()
+    assert not result["success"]
+    assert result["error"]["code"] == "invalid_config"
+
+
+async def test_config_update_conflict_on_stale_revision(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/config/update",
+            "entry_id": scheduler_entry.entry_id,
+            "expected_revision": 999,
+            "patch": {"freeze_guard": {"enabled": True}},
+        }
+    )
+    result = await client.receive_json()
+    assert not result["success"]
+    assert result["error"]["code"] == "revision_conflict"

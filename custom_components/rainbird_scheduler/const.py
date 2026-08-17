@@ -5,7 +5,7 @@ from __future__ import annotations
 DOMAIN = "rainbird_scheduler"
 SOURCE_DOMAIN = "rainbird"
 
-INTEGRATION_VERSION = "0.2.5"
+INTEGRATION_VERSION = "0.3.0"
 
 # Config entry data keys.
 CONF_SOURCE_CONFIG_ENTRY_ID = "source_config_entry_id"
@@ -48,6 +48,13 @@ MAX_COMMAND_ATTEMPTS = len(COMMAND_RETRY_DELAYS_SECONDS) + 1
 # Evidence newer than this counts as fresh when contradicting the commanded
 # clock (the core integration polls valve state every minute).
 OBSERVATION_FRESHNESS_WINDOW_SECONDS = 90
+
+# Freeze guard: a paused run resumes only once the temperature climbs this far
+# back above the threshold (fixed hysteresis, applied in Celsius). A software
+# temperature source is polled far less often than valve state, so it is
+# considered stale — and treated as "temperature unknown" — after this age.
+FREEZE_RESUME_HYSTERESIS_C = "1.0"
+FREEZE_TEMP_STALE_AFTER_SECONDS = 3600
 
 # The Rain Bird public action accepts integer minutes in this range.
 MIN_COMMAND_MINUTES = 1

@@ -19,6 +19,7 @@ from .const import (
     DEFAULT_MISSED_RUN_TOLERANCE_MINUTES,
     DEFAULT_OVERRUN_CONFIRMATION_SECONDS,
     DEFAULT_START_OBSERVATION_TIMEOUT_SECONDS,
+    FREEZE_RESUME_HYSTERESIS_C,
 )
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,21 @@ class MinimumRuntimePolicy(StrEnum):
     SKIP_WITH_WARNING = "skip_with_warning"
     CLAMP_TO_ONE_MINUTE = "clamp_to_one_minute"
     CARRY_FORWARD = "carry_forward"
+
+
+class TemperatureUnit(StrEnum):
+    """Unit a freeze threshold is expressed in. Values match Home Assistant's
+    ``UnitOfTemperature`` so the panel can display them directly."""
+
+    CELSIUS = "°C"
+    FAHRENHEIT = "°F"
+
+
+class FreezeUnavailablePolicy(StrEnum):
+    """What the freeze guard does when the temperature source is unknown."""
+
+    ALLOW_WATERING = "allow_watering"
+    BLOCK_WATERING = "block_watering"
 
 
 class ManualBudgetBehavior(StrEnum):
@@ -203,6 +219,7 @@ class SkipReason(StrEnum):
 
     RAIN_DELAY = "rain_delay"
     RAIN_SENSOR_WET = "rain_sensor_wet"
+    LOW_TEMPERATURE = "low_temperature"
     BELOW_RESOLUTION = "below_resolution"
     OUT_OF_WINDOW = "out_of_window"
     MISSED_TOLERANCE = "missed_tolerance"
@@ -267,6 +284,40 @@ class RainPolicy:
 
 
 @dataclass
+class FreezeGuardConfig:
+    """Controller-level low-temperature guard.
+
+    The Rain Bird LNK module reports only a single "sensor active" boolean and
+    cannot distinguish rain from freeze, so an adjustable freeze threshold is
+    read from a user-chosen Home Assistant temperature source (a ``sensor.*``
+    or ``weather.*`` entity). Behavior lives in :class:`FreezePolicy`; this
+    holds only what and where to measure.
+    """
+
+    enabled: bool = False
+    temperature_entity_id: str | None = None
+    threshold: Decimal = Decimal(1)
+    unit: TemperatureUnit = TemperatureUnit.CELSIUS
+    when_unavailable: FreezeUnavailablePolicy = (
+        FreezeUnavailablePolicy.ALLOW_WATERING
+    )
+
+    def threshold_celsius(self) -> Decimal:
+        """Return the configured threshold normalized to Celsius."""
+        if self.unit is TemperatureUnit.FAHRENHEIT:
+            return (self.threshold - Decimal(32)) * Decimal(5) / Decimal(9)
+        return self.threshold
+
+
+@dataclass
+class FreezePolicy:
+    """Freeze handling for a program (or the controller default)."""
+
+    skip_when_freezing: bool = True
+    freeze_cut_behavior: SensorCutBehavior = SensorCutBehavior.ABORT_RUN
+
+
+@dataclass
 class WateringWindow:
     """Permitted local start window; ``end`` <= ``start`` spans midnight."""
 
@@ -318,10 +369,15 @@ class ControllerConfig:
     missed_run_tolerance_minutes: int = DEFAULT_MISSED_RUN_TOLERANCE_MINUTES
     external_conflict_policy: ConflictPolicy = ConflictPolicy.PAUSE
     default_rain_policy: RainPolicy = field(default_factory=RainPolicy)
+    default_freeze_policy: FreezePolicy = field(default_factory=FreezePolicy)
+    freeze_guard: FreezeGuardConfig = field(default_factory=FreezeGuardConfig)
     minimum_runtime_policy: MinimumRuntimePolicy = (
         MinimumRuntimePolicy.SKIP_WITH_WARNING
     )
     rain_sensor_reference: EntityReference | None = None
+    # Discovery writes ``rain_sensor_reference``; a user override lives here and
+    # is never touched by discovery, so it survives registry re-scans.
+    rain_sensor_override_entity_id: str | None = None
     rain_delay_reference: EntityReference | None = None
     native_calendar_reference: EntityReference | None = None
     manual_run_budget_behavior: ManualBudgetBehavior = ManualBudgetBehavior.UNKNOWN
@@ -394,6 +450,7 @@ class Program:
         default_factory=AdjustmentProviderConfig
     )
     rain_policy: RainPolicy = field(default_factory=RainPolicy)
+    freeze_policy: FreezePolicy = field(default_factory=FreezePolicy)
     missed_run_policy: MissedRunPolicy = MissedRunPolicy.RUN_LATE
     external_interruption_policy: InterruptionPolicy = InterruptionPolicy.PAUSE
     watering_window: WateringWindow | None = None
@@ -590,6 +647,62 @@ class ControllerObservation:
     rain_delay_days: int | None
     source_available: bool
     freshness: ObservationFreshness
+    # Normalized to Celsius by the observation builder; ``None`` when no
+    # temperature source is configured, unavailable, or stale.
+    current_temperature_c: Decimal | None = None
+    temperature_stale: bool = False
+
+
+def freeze_active(
+    guard: FreezeGuardConfig, observation: ControllerObservation | None
+) -> bool | None:
+    """Is the temperature at or below the freeze threshold?
+
+    Returns ``None`` when the guard is disabled or the temperature is unknown
+    (no source, unavailable, or stale) — callers decide what an unknown reading
+    means via :class:`FreezeUnavailablePolicy`.
+    """
+    if not guard.enabled or observation is None:
+        return None
+    temp = observation.current_temperature_c
+    if temp is None:
+        return None
+    return temp <= guard.threshold_celsius()
+
+
+def freeze_cleared(
+    guard: FreezeGuardConfig, observation: ControllerObservation | None
+) -> bool:
+    """Has the temperature climbed a full hysteresis step above the threshold?
+
+    Unknown temperature is treated as *not* cleared: a run paused for freeze
+    had a definite cold reading, and resuming on missing data would water into
+    a possible freeze.
+    """
+    if observation is None:
+        return False
+    temp = observation.current_temperature_c
+    if temp is None:
+        return False
+    return temp >= guard.threshold_celsius() + Decimal(
+        FREEZE_RESUME_HYSTERESIS_C
+    )
+
+
+def attribute_sensor_trip(
+    guard: FreezeGuardConfig, observation: ControllerObservation | None
+) -> str:
+    """Classify an active Rain Bird sensor boolean as freeze vs rain.
+
+    A WR2 combo sensor reports rain and freeze on one boolean. With an
+    independent temperature reading below threshold, the trip is (at least
+    partly) a freeze; otherwise, or when temperature is unknown, it is treated
+    as rain — preserving the pre-freeze-guard behavior. Returns ``"freeze"``,
+    ``"rain"``, or ``"unknown"`` (no active trip / no data).
+    """
+    if observation is None or not observation.rain_sensor_active:
+        return "unknown"
+    return "freeze" if freeze_active(guard, observation) is True else "rain"
 
 
 @dataclass

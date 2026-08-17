@@ -417,12 +417,25 @@ class ControllerConfig:
     missed_run_tolerance_minutes: int
     external_conflict_policy: ConflictPolicy
     default_rain_policy: RainPolicy
+    default_freeze_policy: FreezePolicy
+    freeze_guard: FreezeGuardConfig
     minimum_runtime_policy: MinimumRuntimePolicy
     rain_sensor_reference: EntityReference | None
+    rain_sensor_override_entity_id: str | None
     rain_delay_reference: EntityReference | None
     native_calendar_reference: EntityReference | None
     manual_run_budget_behavior: ManualBudgetBehavior
 ```
+
+`FreezeGuardConfig` holds the controller-level freeze guard: `enabled`, a
+`temperature_entity_id` (a `sensor.*` or `weather.*` source, since the Rain
+Bird LNK module exposes only a rain/freeze boolean and no temperature), a
+`threshold` with its `TemperatureUnit`, and a `when_unavailable` policy
+(`ALLOW_WATERING` default, or `BLOCK_WATERING`). `FreezePolicy` is the
+per-program half (`skip_when_freezing`, `freeze_cut_behavior`), mirroring
+`RainPolicy`. `rain_sensor_override_entity_id` lets a user point rain skips at
+a different binary sensor; discovery only ever writes `rain_sensor_reference`,
+so the override survives registry re-scans.
 
 The renamed timing fields avoid the earlier ambiguous use of “grace”:
 
@@ -1107,6 +1120,10 @@ Alternative policies:
 * Defer the entire remaining requirement.
 
 Rain Bird states that an active rain or rain/freeze sensor can immediately cancel watering, but its documentation is clearest about scheduled watering. Whether all supported controllers similarly terminate a locally requested LNK single-zone manual run must be tested on hardware. ([Rain Bird Connected Device Support][7])
+
+### Software freeze cut
+
+A rain/freeze combo sensor reports rain and freeze on the same LNK boolean and its threshold is set on the sensor hardware, so a *software* freeze guard reads an independent temperature entity and enforces a user-set threshold. Unlike a rain cut — where the hardware has already closed the valve and the executor only classifies the early end — a freeze detected mid-run finds the zone still watering, so the executor issues an explicit stop before applying `freeze_cut_behavior`. The cut reuses `StepStatus.SENSOR_CUT` and `RunOutcome.ABORTED_SENSOR` with a `low_temperature` reason, and a pause reuses `PAUSED_SENSOR` disambiguated by `paused_reason`. A paused run resumes only once the temperature rises a fixed 1 °C above the threshold (hysteresis), and a rain pause never resumes into a freeze nor a freeze pause into a wet sensor. If Home Assistant restarts mid-pause, recovery keeps the pause and a post-recover reading resumes it if the condition cleared during downtime. The same threshold check runs before every occurrence and every zone step (as with the rain delay, §23); when the temperature source is unknown, the `when_unavailable` policy decides between watering and blocking, defaulting to water-and-note.
 
 ### `EXTERNAL_STOP`
 
@@ -2166,7 +2183,7 @@ Implement:
 * External runtime entity.
 * Native rain-delay policy.
 * Rain-sensor cut handling.
-* Forecast and freeze hooks.
+* Freeze hooks — delivered: a software freeze guard reads a temperature/`weather.*` entity and enforces a user-set threshold at every occurrence and zone step, with a mid-run cut, hysteresis resume, and rain-vs-freeze disambiguation on a shared combo sensor (§22).
 * Adjustment provenance.
 
 Expected result:

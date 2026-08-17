@@ -106,6 +106,8 @@ class FakeDriver:
         rain_delay: int | None = 0,
         available: bool = True,
         observed_at: datetime | None = None,
+        temperature_c: Decimal | None = None,
+        temperature_stale: bool = False,
     ) -> ControllerObservation:
         return ControllerObservation(
             observed_at_utc=observed_at or self.tm.now,
@@ -114,6 +116,8 @@ class FakeDriver:
             rain_delay_days=rain_delay,
             source_available=available,
             freshness=ObservationFreshness.FRESH,
+            current_temperature_c=temperature_c,
+            temperature_stale=temperature_stale,
         )
 
     def set_observation(self, active: set[str] | None = None, **kwargs) -> None:
@@ -204,6 +208,25 @@ class Rig:
         )
         self.driver.observation = observation
         await self.executor.async_handle_zone_state(zone_id, is_on, observation)
+        return observation
+
+    async def weather_event(
+        self,
+        *,
+        temperature_c: Decimal | None = None,
+        active: set[str] | None = None,
+        rain_sensor: bool | None = False,
+        temperature_stale: bool = False,
+    ) -> ControllerObservation:
+        """Feed a temperature change with a matching observation."""
+        observation = self.driver.make_observation(
+            active or set(),
+            rain_sensor=rain_sensor,
+            temperature_c=temperature_c,
+            temperature_stale=temperature_stale,
+        )
+        self.driver.observation = observation
+        await self.executor.async_handle_weather_state(observation)
         return observation
 
     def event_types(self) -> list[str]:

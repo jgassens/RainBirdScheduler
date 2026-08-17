@@ -63,6 +63,20 @@ const SENSOR_CUT = [
   ["defer_remaining", "Defer remaining zones"],
 ];
 
+// Same behaviors as SENSOR_CUT; "pause until dry" reads oddly for a freeze.
+const FREEZE_CUT = [
+  ["abort_run", "Abort the run"],
+  ["pause_until_dry", "Pause until clear"],
+  ["defer_remaining", "Defer remaining zones"],
+];
+
+const WHEN_UNAVAILABLE = [
+  ["allow_watering", "Water normally (note it as unknown)"],
+  ["block_watering", "Skip watering until temperature is known"],
+];
+
+const TEMP_UNITS = ["°C", "°F"];
+
 const WINDOW_POLICIES = [
   ["skip_step", "Skip steps outside the window"],
   ["truncate_last", "Truncate the last step"],
@@ -279,6 +293,38 @@ const HELP = {
     edit the program (Programs tab → Edit → Runtime adjustment). Pick
     <i>Automatic seasonal</i> there to have runtimes track the season using
     the curve for the nearest major US city — no numbers to maintain.</p>`,
+
+  settings: `
+    <p class="scen">Say Jonny wants watering to stop when it is near freezing.
+    His Rain Bird WR2 sensor already cuts on freeze, but at a dial on the
+    receiver he cannot see, and it reports rain and freeze on the same wire —
+    so the scheduler cannot tell them apart. This page adds a software freeze
+    guard with a threshold he sets and can see.</p>
+    <p><b class="k">Why a temperature source</b> — the Rain Bird LNK module
+    exposes only one "sensor active" boolean and a rain delay in days. It has
+    no temperature reading and no adjustable threshold. So the freeze guard
+    reads a temperature <i>entity</i> you choose — a <code>weather.*</code>
+    entity from any weather integration, or a <code>sensor.*</code>
+    temperature. No extra hardware needed if you already have a weather
+    integration.</p>
+    <p><b class="k">What the guard adds over the WR2</b> — a threshold you can
+    see and change; <i>pre-emptive</i> skips (a run scheduled while it is
+    already below threshold is skipped before it starts, which a real-time
+    hardware trip cannot do); and correct rain-vs-freeze labeling, since with a
+    temperature reading the panel can tell which one tripped the shared
+    sensor.</p>
+    <p><b class="k">Skip below</b> — the threshold, in your chosen unit.
+    <b class="k">When temperature is unknown</b> — if the source is
+    unavailable or hasn't updated in an hour, either water normally (the
+    default; a missed freeze wastes water, a false block can kill a lawn) or
+    block until a fresh reading returns. A paused run resumes only once the
+    temperature climbs a full degree Celsius back above the threshold, so it
+    does not flap around the setpoint.</p>
+    <p><b class="k">Rain sensor</b> — the Rain Bird sensor is discovered
+    automatically. Override it only to point rain skips at a different binary
+    sensor; your override is kept even when the integration re-scans its
+    entities. Per-program behavior (skip, pause, abort) lives on each
+    program's <i>Rain policy</i> and <i>Freeze policy</i> sections.</p>`,
 
   history: `
     <p class="scen">Say the 6 AM run looked short this morning. Click the run
@@ -616,6 +662,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
       ["programs", "Programs"],
       ["zones", "Zones"],
       ["adjustments", "Adjustments"],
+      ["settings", "Settings"],
       ["history", "History"],
       ["diagnostics", "Diagnostics"],
     ];
@@ -634,6 +681,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
     else if (this._tab === "programs") body = this._renderPrograms();
     else if (this._tab === "zones") body = this._renderZones();
     else if (this._tab === "adjustments") body = this._renderAdjustments();
+    else if (this._tab === "settings") body = this._renderSettings();
     else if (this._tab === "history") body = this._renderHistory();
     else if (this._tab === "diagnostics") body = this._renderDiagnostics();
 
@@ -980,6 +1028,20 @@ class RainBirdSchedulerPanel extends HTMLElement {
       </div>`;
   }
 
+  /* current_temperature_c arrives as a Decimal string in Celsius; render it
+   * in the guard's configured unit. */
+  _fmtTemp(celsius, unit) {
+    const c = Number(celsius);
+    if (Number.isNaN(c)) return "—";
+    const value = unit === "°F" ? c * 1.8 + 32 : c;
+    return `${value.toFixed(1)} ${unit}`;
+  }
+
+  _fmtThreshold(guard) {
+    const t = Number(guard.threshold ?? 0);
+    return `${t.toFixed(1)} ${guard.unit || "°C"}`;
+  }
+
   _renderOverview() {
     const state = this._state;
     const controller = this._config.controller;
@@ -1033,6 +1095,26 @@ class RainBirdSchedulerPanel extends HTMLElement {
       .map((warning) => `<div>⚠️ ${esc(warning.message)}</div>`)
       .join("");
 
+    const guard = controller.freeze_guard || {};
+    const tempC = observation?.current_temperature_c;
+    const tempLabel =
+      tempC == null
+        ? observation?.temperature_stale
+          ? "unknown (stale)"
+          : guard.enabled
+            ? "unknown"
+            : "—"
+        : this._fmtTemp(tempC, guard.unit || "°C");
+    // The Rain Bird boolean covers rain AND freeze; name which one when we can.
+    const sensorLabel =
+      observation?.rain_sensor_active == null
+        ? "No sensor"
+        : observation.rain_sensor_active
+          ? state.freeze_active
+            ? "Likely freeze"
+            : "Sensor WET"
+          : "Sensor dry";
+
     return `
       ${helpBlock("overview", "live state and the compiled plan")}
       ${
@@ -1071,13 +1153,16 @@ class RainBirdSchedulerPanel extends HTMLElement {
             next ? `${esc(next.program_name)} · requested ${fmtTime(next.requested_start_utc)}` : "Nothing scheduled"
           }</div>
         </div>
-        <div class="card"><h3>Rain</h3>
-          <div class="big">${
-            observation?.rain_sensor_active == null
-              ? "No sensor"
-              : observation.rain_sensor_active
-                ? "Sensor WET"
-                : "Sensor dry"
+        <div class="card"><h3>Weather</h3>
+          <div class="big">${esc(sensorLabel)}${
+            state.freeze_active
+              ? ' <span class="chip bad">freeze</span>'
+              : ""
+          }</div>
+          <div class="sub">Temperature: <b>${esc(tempLabel)}</b>${
+            guard.enabled
+              ? ` · freeze threshold ${esc(this._fmtThreshold(guard))}`
+              : ""
           }</div>
           <div class="sub">Native Rain Bird rain delay:
             <b>${rainDelay == null ? "unknown" : `${rainDelay} day${rainDelay === 1 ? "" : "s"}`}</b></div>
@@ -1203,6 +1288,10 @@ class RainBirdSchedulerPanel extends HTMLElement {
         honor_native_delay: true,
         skip_when_sensor_wet: true,
         sensor_cut_behavior: "abort_run",
+      },
+      freeze_policy: {
+        skip_when_freezing: true,
+        freeze_cut_behavior: "abort_run",
       },
       missed_run_policy: "run_late",
       external_interruption_policy: "pause",
@@ -1378,6 +1467,19 @@ class RainBirdSchedulerPanel extends HTMLElement {
             ).join("")}</select></label>
         </div>
 
+        <div class="section">Freeze policy</div>
+        <div class="explain">Uses the temperature source and threshold set on
+          the Settings tab; here you choose whether this program obeys it.</div>
+        <div class="row">
+          <label><input id="f-skip-freeze" type="checkbox" ${draft.freeze_policy?.skip_when_freezing ? "checked" : ""}>
+            Skip when below the freeze threshold</label>
+          <label class="f">On freeze during a run
+            <select id="f-freeze-cut">${FREEZE_CUT.map(
+              ([value, label]) =>
+                `<option value="${value}" ${draft.freeze_policy?.freeze_cut_behavior === value ? "selected" : ""}>${label}</option>`,
+            ).join("")}</select></label>
+        </div>
+
         <div class="section">Policies</div>
         <div class="row">
           <label class="f">Missed run
@@ -1516,6 +1618,10 @@ class RainBirdSchedulerPanel extends HTMLElement {
     draft.rain_policy.honor_native_delay = checked("f-honor-delay");
     draft.rain_policy.skip_when_sensor_wet = checked("f-skip-wet");
     draft.rain_policy.sensor_cut_behavior = value("f-sensor-cut");
+    draft.freeze_policy = {
+      skip_when_freezing: checked("f-skip-freeze"),
+      freeze_cut_behavior: value("f-freeze-cut") || "abort_run",
+    };
     draft.missed_run_policy = value("f-missed");
     draft.external_interruption_policy = value("f-interrupt");
     draft.watering_window = checked("f-window-on")
@@ -1745,6 +1851,124 @@ class RainBirdSchedulerPanel extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
+  // Settings (controller-level configuration)
+  // ------------------------------------------------------------------
+
+  /* <option> list for a datalist, from the live entity registry. */
+  _entityOptions(predicate) {
+    const states = this._hass?.states || {};
+    return Object.keys(states)
+      .filter(predicate)
+      .sort()
+      .map((id) => `<option value="${esc(id)}"></option>`)
+      .join("");
+  }
+
+  _renderSettings() {
+    const controller = this._config.controller;
+    const guard = controller.freeze_guard || {};
+    const states = this._hass?.states || {};
+    const isTemp = (id) =>
+      id.startsWith("weather.") ||
+      (id.startsWith("sensor.") &&
+        (states[id]?.attributes?.device_class === "temperature" ||
+          ["°C", "°F", "K"].includes(
+            states[id]?.attributes?.unit_of_measurement,
+          )));
+    const tempOptions = this._entityOptions(isTemp);
+    const rainOptions = this._entityOptions((id) =>
+      id.startsWith("binary_sensor."),
+    );
+    const discovered =
+      controller.rain_sensor_reference?.last_known_entity_id || "—";
+
+    return `
+      ${helpBlock("settings", "connecting the rain sensor and freeze guard")}
+      <div class="card">
+        <div class="section" style="margin-top:0">Weather protection</div>
+        <div class="explain">A software low-temperature guard. Your Rain Bird
+          sensor reports only one on/off signal (rain or freeze), so an
+          adjustable freeze threshold reads from a temperature entity you
+          choose — a weather integration works, no extra hardware.</div>
+        <div class="row">
+          <label><input id="s-freeze-enabled" type="checkbox"
+            ${guard.enabled ? "checked" : ""}> Enable freeze guard</label>
+        </div>
+        <div class="row">
+          <label class="f">Temperature source (entity id)
+            <input id="s-temp-entity" list="s-temp-list"
+              placeholder="weather.home or sensor.outdoor_temp"
+              value="${esc(guard.temperature_entity_id ?? "")}">
+            <datalist id="s-temp-list">${tempOptions}</datalist></label>
+          <label class="f">Skip below
+            <input id="s-threshold" type="number" step="0.5"
+              style="width:80px" value="${esc(guard.threshold ?? "1")}"></label>
+          <label class="f">Unit
+            <select id="s-unit">${TEMP_UNITS.map(
+              (u) =>
+                `<option value="${u}" ${(guard.unit || "°C") === u ? "selected" : ""}>${u}</option>`,
+            ).join("")}</select></label>
+        </div>
+        <div class="row">
+          <label class="f">When temperature is unknown
+            <select id="s-when-unavailable">${WHEN_UNAVAILABLE.map(
+              ([v, label]) =>
+                `<option value="${v}" ${(guard.when_unavailable || "allow_watering") === v ? "selected" : ""}>${label}</option>`,
+            ).join("")}</select></label>
+        </div>
+
+        <div class="section">Rain sensor</div>
+        <div class="explain">Auto-discovered from the Rain Bird integration.
+          Override only if you want a different binary sensor (e.g. a separate
+          soil-moisture sensor) to drive rain skips.</div>
+        <div class="row">
+          <label class="f">Discovered
+            <input value="${esc(discovered)}" readonly
+              style="background:var(--secondary-background-color,#f0f0f0)"></label>
+          <label class="f">Override (entity id, optional)
+            <input id="s-rain-override" list="s-rain-list"
+              placeholder="leave blank to use discovered"
+              value="${esc(controller.rain_sensor_override_entity_id ?? "")}">
+            <datalist id="s-rain-list">${rainOptions}</datalist></label>
+        </div>
+
+        <div class="row" style="margin-top:10px">
+          <button class="btn" data-action="save-settings">Save settings</button>
+        </div>
+      </div>`;
+  }
+
+  async _saveSettings() {
+    const root = this.shadowRoot;
+    const value = (id) => root.getElementById(id)?.value;
+    const checked = (id) => !!root.getElementById(id)?.checked;
+    const controller = this._config.controller;
+    const override = (value("s-rain-override") || "").trim();
+    const tempEntity = (value("s-temp-entity") || "").trim();
+    const patch = {
+      freeze_guard: {
+        enabled: checked("s-freeze-enabled"),
+        temperature_entity_id: tempEntity || null,
+        threshold: String(value("s-threshold") || "1"),
+        unit: value("s-unit") || "°C",
+        when_unavailable: value("s-when-unavailable") || "allow_watering",
+      },
+      rain_sensor_override_entity_id: override || null,
+    };
+    await this._action(
+      this.api({
+        type: `${DOMAIN}/config/update`,
+        entry_id: this._entryId,
+        expected_revision: controller.revision,
+        patch,
+      }),
+      "Settings saved",
+    );
+    await this._loadConfig();
+    this.render();
+  }
+
+  // ------------------------------------------------------------------
   // History
   // ------------------------------------------------------------------
 
@@ -1871,6 +2095,9 @@ class RainBirdSchedulerPanel extends HTMLElement {
       case "recalculate":
         await this._loadAll();
         this._toastMsg("Plan recalculated");
+        break;
+      case "save-settings":
+        await this._saveSettings();
         break;
       case "run-program":
         await this._action(

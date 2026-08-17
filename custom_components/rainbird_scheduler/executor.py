@@ -50,6 +50,8 @@ from .models import (
     ControllerObservation,
     ExecutionJournal,
     ExecutorState,
+    FreezePolicy,
+    FreezeUnavailablePolicy,
     InterruptionPolicy,
     PendingCommand,
     Program,
@@ -60,7 +62,12 @@ from .models import (
     StepResult,
     StepStatus,
     ZoneReference,
+    freeze_active,
+    freeze_cleared,
 )
+
+# Distinguishes the two conditions that share ExecutorState.PAUSED_SENSOR.
+_PAUSE_REASON_FREEZE = "low_temperature"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -334,7 +341,7 @@ class RunExecutor:
                 and self.journal.paused_reason is None
             ) or (
                 state is ExecutorState.PAUSED_SENSOR
-                and observation.rain_sensor_active is False
+                and self._sensor_pause_cleared(observation)
             ):
                 await self._resume_or_expire()
         self._notify()
@@ -347,10 +354,95 @@ class RunExecutor:
             self.journal.last_observation = observation
             if (
                 self.journal.state is ExecutorState.PAUSED_SENSOR
-                and observation.rain_sensor_active is False
+                and self._sensor_pause_cleared(observation)
             ):
                 await self._resume_or_expire()
         self._notify()
+
+    async def async_handle_weather_state(
+        self, observation: ControllerObservation
+    ) -> None:
+        """Feed a temperature change: cut an active run on freeze, or resume."""
+        async with self._lock:
+            self.journal.last_observation = observation
+            if self.journal.run_plan is None:
+                return
+            state = self.journal.state
+            guard = self._config().freeze_guard
+            if state is ExecutorState.WATERING:
+                program = self._get_program(self._plan().program_id)
+                if (
+                    guard.enabled
+                    and self._freeze_policy(program).skip_when_freezing
+                    and freeze_active(guard, observation) is True
+                ):
+                    await self._freeze_cut()
+            elif (
+                state is ExecutorState.PAUSED_SENSOR
+                and self._sensor_pause_cleared(observation)
+            ):
+                await self._resume_or_expire()
+        self._notify()
+
+    def _sensor_pause_cleared(
+        self, observation: ControllerObservation
+    ) -> bool:
+        """May a sensor pause resume? Both conditions must be clear.
+
+        A freeze pause needs the temperature back above threshold + hysteresis
+        (and not newly wet); a rain-wet pause needs the boolean dry (and not
+        newly freezing) — so a run never resumes straight into the other block.
+        """
+        guard = self._config().freeze_guard
+        if self.journal.paused_reason == _PAUSE_REASON_FREEZE:
+            return (
+                freeze_cleared(guard, observation)
+                and observation.rain_sensor_active is not True
+            )
+        return (
+            observation.rain_sensor_active is False
+            and freeze_active(guard, observation) is not True
+        )
+
+    async def _freeze_cut(self) -> None:
+        """Software freeze cut of the active zone: stop, then apply behavior.
+
+        Unlike a rain cut (the hardware already closed the valve), the zone is
+        still running, so this issues an explicit stop before classifying.
+        """
+        journal = self.journal
+        plan = self._plan()
+        index = journal.current_step_index
+        step = plan.steps[index]
+        self._cancel_pending_timer()
+        await self._send_stop()
+        self._end_step(index, StepStatus.SENSOR_CUT, _PAUSE_REASON_FREEZE)
+        self._emit(
+            EVENT_SENSOR_CUT,
+            {
+                "run_id": plan.run_id,
+                "zone_id": step.zone_id,
+                "zone_name": step.zone_name,
+                "kind": "freeze",
+            },
+        )
+        behavior = self._freeze_policy(
+            self._get_program(plan.program_id)
+        ).freeze_cut_behavior
+        if behavior is SensorCutBehavior.PAUSE_UNTIL_DRY:
+            journal.state = ExecutorState.PAUSED_SENSOR
+            journal.paused_reason = _PAUSE_REASON_FREEZE
+            await self._write()
+            return
+        detail = (
+            "deferred"
+            if behavior is SensorCutBehavior.DEFER_REMAINING
+            else "freeze cut"
+        )
+        self._skip_remaining(SkipReason.LOW_TEMPERATURE, detail)
+        await self._finish_run(
+            RunOutcome.ABORTED_SENSOR, SkipReason.LOW_TEMPERATURE.value
+        )
 
     async def async_recover(self) -> None:
         """Reconcile the persisted journal against observed state (§28)."""
@@ -616,6 +708,18 @@ class RunExecutor:
                 )
                 return True
 
+            if self._freeze_blocks(program, observation):
+                self._skip_remaining(
+                    SkipReason.LOW_TEMPERATURE, "temperature at/below threshold"
+                )
+                await self._finish_run(
+                    RunOutcome.ABORTED_SENSOR
+                    if self._any_completed()
+                    else RunOutcome.SKIPPED,
+                    SkipReason.LOW_TEMPERATURE.value,
+                )
+                return True
+
             external = self._external_zones(observation, index)
             if external:
                 journal.state = ExecutorState.PAUSED_EXTERNAL
@@ -630,6 +734,31 @@ class RunExecutor:
                 )
                 return True
         return False
+
+    def _freeze_policy(self, program: Program | None) -> FreezePolicy:
+        return (
+            program.freeze_policy
+            if program is not None
+            else self._config().default_freeze_policy
+        )
+
+    def _freeze_blocks(
+        self, program: Program | None, observation: ControllerObservation
+    ) -> bool:
+        """True when the freeze guard should stop a run from proceeding.
+
+        Definite cold blocks; unknown temperature blocks only under the
+        block-when-unavailable policy (matching the pre-occurrence check).
+        """
+        guard = self._config().freeze_guard
+        if not guard.enabled or not self._freeze_policy(program).skip_when_freezing:
+            return False
+        active = freeze_active(guard, observation)
+        if active is True:
+            return True
+        return active is None and guard.when_unavailable is (
+            FreezeUnavailablePolicy.BLOCK_WATERING
+        )
 
     def _external_zones(
         self, observation: ControllerObservation, upcoming_index: int
@@ -1121,6 +1250,7 @@ class RunExecutor:
     async def _resume_or_expire(self) -> None:
         """Continue a paused run, or expire it past the tolerance."""
         journal = self.journal
+        journal.paused_reason = None
         if self._now() <= self._latest_permissible_start():
             journal.state = ExecutorState.WAITING
             await self._write()

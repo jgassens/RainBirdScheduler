@@ -26,7 +26,7 @@ from .coordinator import (
     SchedulerCoordinator,
 )
 from .executor import ControllerBusyError
-from .models import AuthorityMode
+from .models import AuthorityMode, freeze_active
 
 ERR_NOT_FOUND = "entry_not_found"
 ERR_REVISION = "revision_conflict"
@@ -90,6 +90,24 @@ def _with_coordinator(
     return wrapper
 
 
+def _entity_ids_well_formed(patch: dict[str, Any]) -> bool:
+    """Reject an obvious non-entity-id (e.g. a bare number) in id fields.
+
+    A full validity check happens when the entity is read; this only catches
+    the common "typed 50 into the entity box" mistake early.
+    """
+    if (override := patch.get("rain_sensor_override_entity_id")) and (
+        "." not in override
+    ):
+        return False
+    guard = patch.get("freeze_guard")
+    if isinstance(guard, dict):
+        entity = guard.get("temperature_entity_id")
+        if entity and "." not in entity:
+            return False
+    return True
+
+
 def _snapshot(coordinator: SchedulerCoordinator) -> dict[str, Any]:
     journal = coordinator.executor.journal
     active_step = coordinator.active_step()
@@ -107,6 +125,9 @@ def _snapshot(coordinator: SchedulerCoordinator) -> dict[str, Any]:
         "native_schedule_conflict": coordinator.native_schedule_conflict,
         "source_available": coordinator.source_available,
         "observation": serde.dump(observation),
+        "freeze_active": freeze_active(
+            coordinator.config.controller.freeze_guard, observation
+        ),
     }
 
 
@@ -195,6 +216,13 @@ async def ws_config_update(
     coordinator: SchedulerCoordinator,
 ) -> None:
     patch = msg["patch"]
+    if not _entity_ids_well_formed(patch):
+        connection.send_error(
+            msg["id"],
+            "invalid_config",
+            "Expected an entity id like sensor.outdoor_temperature.",
+        )
+        return
     if "authority_mode" in patch:
         try:
             new_mode = AuthorityMode(patch["authority_mode"])

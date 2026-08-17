@@ -71,6 +71,13 @@ and the reason for any delay, skip, or adjustment.
   (Rain Bird controllers ignore their own delay for manual runs, which is what
   every scheduler-issued run is); rain-sensor cuts get their own classified
   outcome.
+- **Weather protection** — connect the Rain Bird rain sensor with per-program
+  skip/pause/abort behavior, plus a software freeze guard with an adjustable
+  threshold read from any temperature or `weather.*` entity (the Rain Bird LNK
+  module exposes only one rain/freeze boolean and no temperature). The guard
+  adds a visible threshold, pre-emptive skips before a run starts, and correct
+  rain-vs-freeze labeling on a shared combo sensor. Configured on the Settings
+  tab.
 - **Conflict awareness** — app/manual activity detection, single-flight runs
   per controller, external-stop classification, native-schedule conflict
   warnings.

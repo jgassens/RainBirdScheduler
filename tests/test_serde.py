@@ -196,3 +196,63 @@ def test_dedup_window_is_bounded() -> None:
     from custom_components.rainbird_scheduler.const import DEDUP_MAX_OCCURRENCES
 
     assert len(journal.completed_occurrences) <= DEDUP_MAX_OCCURRENCES
+
+
+def test_controller_roundtrips_freeze_config() -> None:
+    from custom_components.rainbird_scheduler.models import (
+        ControllerConfig,
+        FreezeGuardConfig,
+        FreezeUnavailablePolicy,
+        TemperatureUnit,
+    )
+
+    controller = make_controller(
+        freeze_guard=FreezeGuardConfig(
+            enabled=True,
+            temperature_entity_id="weather.home",
+            threshold=Decimal(36),
+            unit=TemperatureUnit.FAHRENHEIT,
+            when_unavailable=FreezeUnavailablePolicy.BLOCK_WATERING,
+        ),
+        rain_sensor_override_entity_id="binary_sensor.custom_rain",
+    )
+    loaded = serde.load(ControllerConfig, serde.dump(controller))
+    assert loaded.freeze_guard.enabled is True
+    assert loaded.freeze_guard.temperature_entity_id == "weather.home"
+    assert loaded.freeze_guard.unit is TemperatureUnit.FAHRENHEIT
+    assert (
+        loaded.freeze_guard.when_unavailable
+        is FreezeUnavailablePolicy.BLOCK_WATERING
+    )
+    assert loaded.rain_sensor_override_entity_id == "binary_sensor.custom_rain"
+
+
+def test_legacy_config_loads_freeze_defaults() -> None:
+    from custom_components.rainbird_scheduler.models import ControllerConfig
+
+    legacy = {
+        "id": "c",
+        "revision": 1,
+        "source_config_entry_id": "e",
+        "source_unique_id": "u",
+    }
+    loaded = serde.load(ControllerConfig, legacy)
+    assert loaded.freeze_guard.enabled is False
+    assert loaded.default_freeze_policy.skip_when_freezing is True
+    assert loaded.rain_sensor_override_entity_id is None
+
+
+def test_observation_roundtrips_temperature() -> None:
+    observation = ControllerObservation(
+        observed_at_utc=NOW,
+        active_zone_ids=frozenset(),
+        rain_sensor_active=False,
+        rain_delay_days=0,
+        source_available=True,
+        freshness=ObservationFreshness.FRESH,
+        current_temperature_c=Decimal("-3.5"),
+        temperature_stale=True,
+    )
+    loaded = serde.load(ControllerObservation, serde.dump(observation))
+    assert loaded.current_temperature_c == Decimal("-3.5")
+    assert loaded.temperature_stale is True

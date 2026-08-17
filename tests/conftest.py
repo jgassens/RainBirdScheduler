@@ -53,6 +53,7 @@ def source_entry(hass: HomeAssistant) -> MockConfigEntry:
         "aabbcc-rainsensor",
         config_entry=source,
         original_name="Rainsensor",
+        original_device_class="moisture",
         suggested_object_id="rain_bird_rainsensor",
     )
     hass.states.async_set(sensor.entity_id, "off", {})
