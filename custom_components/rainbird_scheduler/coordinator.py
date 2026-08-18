@@ -559,12 +559,18 @@ class SchedulerCoordinator:
         """Recompile the preview timeline and arm the next occurrence."""
         now = dt_util.utcnow()
         tz = dt_util.get_default_time_zone()
+        # Start the horizon at the top of today (local) rather than "now" so
+        # occurrences that have already run today stay in the compiled
+        # timeline — the panel dims them instead of dropping the whole row to
+        # "no watering". next_pending_run and the arming path skip anything
+        # already past, so a wider window never re-fires an elapsed run.
+        window_start = dt_util.as_utc(dt_util.start_of_local_day())
         window_end = now + timedelta(days=PLAN_HORIZON_DAYS)
 
         occurrences: list[ProgramOccurrence] = []
         for program in self.config.programs.values():
             found, _warnings = occurrences_between(
-                program, tz, now, window_end, now
+                program, tz, window_start, window_end, now
             )
             occurrences.extend(found)
 
@@ -598,10 +604,15 @@ class SchedulerCoordinator:
         journal = self.executor.journal if self.executor else None
         completed = journal.completed_occurrences if journal else {}
         active = journal.active_occurrence_id if journal else None
+        now = dt_util.utcnow()
         for run in self.timeline.runs:
             if not run.steps:
                 continue
             if run.occurrence_id in completed or run.occurrence_id == active:
+                continue
+            # Today's already-elapsed occurrences now live in the timeline for
+            # display; they are not candidates to arm or report as "next".
+            if run.requested_start_utc < now:
                 continue
             return run
         return None

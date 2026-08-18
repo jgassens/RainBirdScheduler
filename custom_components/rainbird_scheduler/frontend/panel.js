@@ -590,6 +590,10 @@ class RainBirdSchedulerPanel extends HTMLElement {
       .tl-empty { fill:var(--tl-muted); font-size:11px; font-style:italic; }
       .tl-bar { stroke:var(--card-background-color,#fff); stroke-width:1; }
       .tl-bar:hover { filter:brightness(1.15); }
+      /* Already-elapsed cycles keep their zone hue but read as dimmer/duller
+       * so the eye lands on what is still to come. */
+      .tl-bar.past { opacity:.3; }
+      .tl-bar.past:hover { opacity:.5; filter:none; }
       .tl-now { stroke:var(--tl-muted); stroke-width:1; stroke-dasharray:3 3; }
       .tl-nowlabel { fill:var(--tl-muted); font-size:10px; }
       .tl-legend { display:flex; flex-wrap:wrap; gap:4px 16px; padding:8px 4px 2px;
@@ -985,12 +989,14 @@ class RainBirdSchedulerPanel extends HTMLElement {
           step.cycle_count > 1
             ? ` · cycle ${step.cycle_index}/${step.cycle_count}`
             : "";
+        const past = end < now;
         const tip =
           `${run.program_name} — ${step.zone_name}${cycle}\n` +
           `${fmtShort(start)}–${fmtShort(end)} · ${step.duration_minutes} min` +
-          ` (${step.exact_minutes} exact)`;
+          ` (${step.exact_minutes} exact)` +
+          (past ? "\nAlready ran" : "");
         rows += `<rect x="${x1}" y="${y + (ROW - BAR) / 2}" width="${width}" height="${BAR}"
-          rx="2" class="tl-bar" style="fill:var(--s${slot})" data-tip="${esc(tip)}">
+          rx="2" class="tl-bar${past ? " past" : ""}" style="fill:var(--s${slot})" data-tip="${esc(tip)}">
           <title>${esc(tip)}</title></rect>`;
       }
     });
