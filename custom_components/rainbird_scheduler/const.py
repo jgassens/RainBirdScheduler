@@ -5,7 +5,7 @@ from __future__ import annotations
 DOMAIN = "rainbird_scheduler"
 SOURCE_DOMAIN = "rainbird"
 
-INTEGRATION_VERSION = "0.4.2"
+INTEGRATION_VERSION = "0.4.3"
 
 # Config entry data keys.
 CONF_SOURCE_CONFIG_ENTRY_ID = "source_config_entry_id"

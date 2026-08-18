@@ -125,7 +125,11 @@ def _snapshot(coordinator: SchedulerCoordinator) -> dict[str, Any]:
     journal = coordinator.executor.journal
     active_step = coordinator.active_step()
     next_run = coordinator.next_pending_run()
-    observation = coordinator.last_observation
+    # Read the source entities now rather than serving the cached
+    # observation: the cache only refreshes on watched state-change
+    # events, so on an idle system fresh from a restart it is None and
+    # the panel would render every reading as unknown.
+    observation = coordinator.build_observation()
     return {
         "executor_state": journal.state.value,
         "active_run": serde.dump(journal.run_plan),
