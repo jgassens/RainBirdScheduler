@@ -8,6 +8,10 @@ import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from custom_components.rainbird_scheduler.models import (
+    ControllerObservation,
+    RainDelayStatus,
+)
 from custom_components.rainbird_scheduler.observations import build_observation
 
 
@@ -100,3 +104,55 @@ async def test_unparsable_rain_delay_is_unknown(
         now=dt_util.utcnow(),
     )
     assert observation.rain_delay_days is None
+    assert observation.rain_delay_status is RainDelayStatus.INVALID
+
+
+def _delay_observation(hass: HomeAssistant) -> ControllerObservation:
+    return build_observation(
+        hass,
+        zone_entities={},
+        rain_sensor_entity=None,
+        rain_delay_entity="number.rain_delay",
+        now=dt_util.utcnow(),
+    )
+
+
+async def test_rain_delay_status_distinguishes_causes(
+    hass: HomeAssistant,
+) -> None:
+    """Each way of not knowing the delay carries its own status (no bare
+    'unknown' conflating them)."""
+    # No entity discovered at all.
+    observation = build_observation(
+        hass,
+        zone_entities={},
+        rain_sensor_entity=None,
+        rain_delay_entity=None,
+        now=dt_util.utcnow(),
+    )
+    assert observation.rain_delay_status is RainDelayStatus.NO_ENTITY
+
+    # Entity id known but absent from the state machine.
+    assert (
+        _delay_observation(hass).rain_delay_status
+        is RainDelayStatus.UNAVAILABLE
+    )
+
+    hass.states.async_set("number.rain_delay", "unavailable", {})
+    assert (
+        _delay_observation(hass).rain_delay_status
+        is RainDelayStatus.UNAVAILABLE
+    )
+
+    # Exists but has not produced a value yet (post-restart, pre-poll).
+    hass.states.async_set("number.rain_delay", "unknown", {})
+    assert (
+        _delay_observation(hass).rain_delay_status
+        is RainDelayStatus.NOT_YET_READ
+    )
+
+    # Healthy read.
+    hass.states.async_set("number.rain_delay", "2", {})
+    observation = _delay_observation(hass)
+    assert observation.rain_delay_status is RainDelayStatus.OK
+    assert observation.rain_delay_days == 2

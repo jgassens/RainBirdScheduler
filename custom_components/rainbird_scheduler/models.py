@@ -637,6 +637,21 @@ class PendingCommand:
         )
 
 
+class RainDelayStatus(StrEnum):
+    """Why ``rain_delay_days`` is (or is not) known.
+
+    A bare ``None`` conflates states with different remediations: the
+    panel needs to distinguish "no entity to read" from "entity exists
+    but has not reported yet" from "the source is down".
+    """
+
+    OK = "ok"
+    NO_ENTITY = "no_entity"
+    UNAVAILABLE = "unavailable"
+    NOT_YET_READ = "not_yet_read"
+    INVALID = "invalid"
+
+
 @dataclass
 class ControllerObservation:
     """A snapshot of what the source entities currently report."""
@@ -651,6 +666,10 @@ class ControllerObservation:
     # temperature source is configured, unavailable, or stale.
     current_temperature_c: Decimal | None = None
     temperature_stale: bool = False
+    # Defaults to OK so observations persisted before the field existed
+    # load cleanly; the panel falls back to a generic label when days is
+    # None but the status claims OK.
+    rain_delay_status: RainDelayStatus = RainDelayStatus.OK
 
 
 def freeze_active(

@@ -18,7 +18,11 @@ from .const import (
     FREEZE_TEMP_STALE_AFTER_SECONDS,
     OBSERVATION_FRESHNESS_WINDOW_SECONDS,
 )
-from .models import ControllerObservation, ObservationFreshness
+from .models import (
+    ControllerObservation,
+    ObservationFreshness,
+    RainDelayStatus,
+)
 
 _BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 
@@ -102,15 +106,22 @@ def build_observation(
             rain_sensor_active = state.state == STATE_ON
 
     rain_delay_days: int | None = None
+    rain_delay_status = RainDelayStatus.NO_ENTITY
     if rain_delay_entity:
         state = hass.states.get(rain_delay_entity)
-        if _usable(state):
-            assert state is not None
+        if state is None or state.state == STATE_UNAVAILABLE:
+            rain_delay_status = RainDelayStatus.UNAVAILABLE
+        elif state.state == STATE_UNKNOWN:
+            # HA semantics: the entity exists but has not produced a
+            # value yet (typically pre-first-poll after a restart).
+            rain_delay_status = RainDelayStatus.NOT_YET_READ
+        else:
             try:
                 rain_delay_days = int(float(state.state))
+                rain_delay_status = RainDelayStatus.OK
             except (ValueError, OverflowError):
                 # 'inf'/'1e400' overflow the int conversion.
-                rain_delay_days = None
+                rain_delay_status = RainDelayStatus.INVALID
 
     current_temperature_c: Decimal | None = None
     temperature_stale = False
@@ -137,4 +148,5 @@ def build_observation(
         freshness=freshness,
         current_temperature_c=current_temperature_c,
         temperature_stale=temperature_stale,
+        rain_delay_status=rain_delay_status,
     )

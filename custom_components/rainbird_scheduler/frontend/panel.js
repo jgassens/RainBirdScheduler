@@ -1048,6 +1048,24 @@ class RainBirdSchedulerPanel extends HTMLElement {
     return `${t.toFixed(1)} ${guard.unit || "°C"}`;
   }
 
+  /* One label per distinct cause: "unknown" alone hides whether there is
+   * no entity to read, the source is down, or it just hasn't reported. */
+  _rainDelayLabel(days, status) {
+    if (days != null) return `${days} day${days === 1 ? "" : "s"}`;
+    switch (status) {
+      case "no_entity":
+        return "no delay entity found";
+      case "unavailable":
+        return "source unavailable";
+      case "not_yet_read":
+        return "not read yet";
+      case "invalid":
+        return "unreadable value";
+      default:
+        return "unknown"; // pre-upgrade observation payloads
+    }
+  }
+
   _renderOverview() {
     const state = this._state;
     const controller = this._config.controller;
@@ -1171,7 +1189,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
               : ""
           }</div>
           <div class="sub">Native Rain Bird rain delay:
-            <b>${rainDelay == null ? "unknown" : `${rainDelay} day${rainDelay === 1 ? "" : "s"}`}</b></div>
+            <b>${esc(this._rainDelayLabel(rainDelay, observation?.rain_delay_status))}</b></div>
         </div>
         <div class="card"><h3>Status flags</h3>
           <div>${state.source_available ? '<span class="chip on">source available</span>' : '<span class="chip bad">source unavailable</span>'}</div>
