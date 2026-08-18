@@ -1050,6 +1050,30 @@ class RainBirdSchedulerPanel extends HTMLElement {
 
   /* One label per distinct cause: "unknown" alone hides whether there is
    * no entity to read, the source is down, or it just hasn't reported. */
+  _temperatureLabel(tempC, observation, guard) {
+    if (tempC != null) return this._fmtTemp(tempC, guard.unit || "°C");
+    switch (observation?.temperature_status) {
+      case "no_entity":
+        // Nothing configured: a quiet dash unless the guard needs one.
+        return guard.enabled ? "no temperature source" : "—";
+      case "unavailable":
+        return "source unavailable";
+      case "no_value":
+        return "no reading";
+      case "invalid":
+        return "unreadable value";
+      case "stale":
+        return "stale (ignored)";
+      default:
+        // Pre-upgrade payloads: keep the old wording.
+        return observation?.temperature_stale
+          ? "unknown (stale)"
+          : guard.enabled
+            ? "unknown"
+            : "—";
+    }
+  }
+
   _rainDelayLabel(days, status) {
     if (days != null) return `${days} day${days === 1 ? "" : "s"}`;
     switch (status) {
@@ -1121,14 +1145,7 @@ class RainBirdSchedulerPanel extends HTMLElement {
 
     const guard = controller.freeze_guard || {};
     const tempC = observation?.current_temperature_c;
-    const tempLabel =
-      tempC == null
-        ? observation?.temperature_stale
-          ? "unknown (stale)"
-          : guard.enabled
-            ? "unknown"
-            : "—"
-        : this._fmtTemp(tempC, guard.unit || "°C");
+    const tempLabel = this._temperatureLabel(tempC, observation, guard);
     // The Rain Bird boolean covers rain AND freeze; name which one when we can.
     const sensorLabel =
       observation?.rain_sensor_active == null

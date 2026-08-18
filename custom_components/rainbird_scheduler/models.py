@@ -637,6 +637,17 @@ class PendingCommand:
         )
 
 
+class TemperatureStatus(StrEnum):
+    """Why ``current_temperature_c`` is (or is not) known."""
+
+    OK = "ok"
+    NO_ENTITY = "no_entity"
+    UNAVAILABLE = "unavailable"
+    NO_VALUE = "no_value"
+    INVALID = "invalid"
+    STALE = "stale"
+
+
 class RainDelayStatus(StrEnum):
     """Why ``rain_delay_days`` is (or is not) known.
 
@@ -666,10 +677,11 @@ class ControllerObservation:
     # temperature source is configured, unavailable, or stale.
     current_temperature_c: Decimal | None = None
     temperature_stale: bool = False
-    # Defaults to OK so observations persisted before the field existed
-    # load cleanly; the panel falls back to a generic label when days is
-    # None but the status claims OK.
+    # Both statuses default to OK so observations persisted before the
+    # fields existed load cleanly; the panel falls back to a generic
+    # label when the value is None but the status claims OK.
     rain_delay_status: RainDelayStatus = RainDelayStatus.OK
+    temperature_status: TemperatureStatus = TemperatureStatus.OK
 
 
 def freeze_active(

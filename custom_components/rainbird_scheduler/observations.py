@@ -22,6 +22,7 @@ from .models import (
     ControllerObservation,
     ObservationFreshness,
     RainDelayStatus,
+    TemperatureStatus,
 )
 
 _BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -33,17 +34,18 @@ def _usable(state: State | None) -> bool:
 
 def _read_temperature_c(
     hass: HomeAssistant, entity_id: str, now: datetime
-) -> tuple[Decimal | None, bool]:
+) -> tuple[Decimal | None, TemperatureStatus]:
     """Read a temperature source normalized to Celsius.
 
-    Returns ``(celsius, stale)``. ``weather.*`` entities carry the temperature
-    in an attribute; other domains put it in the state. A reading older than
-    the staleness window returns ``(None, True)`` so the guard fails to
-    "unknown" rather than trusting cold data from hours ago.
+    Returns ``(celsius, status)``. ``weather.*`` entities carry the
+    temperature in an attribute; other domains put it in the state. A
+    reading older than the staleness window returns ``(None, STALE)`` so
+    the guard fails to "unknown" rather than trusting cold data from
+    hours ago; the other statuses name why there is no value at all.
     """
     state = hass.states.get(entity_id)
     if not _usable(state):
-        return None, False
+        return None, TemperatureStatus.UNAVAILABLE
     assert state is not None
 
     if entity_id.startswith("weather."):
@@ -53,7 +55,7 @@ def _read_temperature_c(
         raw = state.state
         unit = state.attributes.get("unit_of_measurement")
     if raw is None:
-        return None, False
+        return None, TemperatureStatus.NO_VALUE
     if unit not in (UnitOfTemperature.CELSIUS, UnitOfTemperature.FAHRENHEIT):
         # Missing/odd unit: assume the instance's configured unit system.
         unit = hass.config.units.temperature_unit
@@ -64,12 +66,12 @@ def _read_temperature_c(
         )
         value = Decimal(str(celsius))
     except (ValueError, TypeError, InvalidOperation):
-        return None, False
+        return None, TemperatureStatus.INVALID
 
     reported = getattr(state, "last_reported", None) or state.last_updated
     if now - reported > timedelta(seconds=FREEZE_TEMP_STALE_AFTER_SECONDS):
-        return None, True
-    return value, False
+        return None, TemperatureStatus.STALE
+    return value, TemperatureStatus.OK
 
 
 def build_observation(
@@ -124,11 +126,12 @@ def build_observation(
                 rain_delay_status = RainDelayStatus.INVALID
 
     current_temperature_c: Decimal | None = None
-    temperature_stale = False
+    temperature_status = TemperatureStatus.NO_ENTITY
     if temperature_entity:
-        current_temperature_c, temperature_stale = _read_temperature_c(
+        current_temperature_c, temperature_status = _read_temperature_c(
             hass, temperature_entity, now
         )
+    temperature_stale = temperature_status is TemperatureStatus.STALE
 
     if newest_report is None:
         freshness = ObservationFreshness.UNKNOWN
@@ -149,4 +152,5 @@ def build_observation(
         current_temperature_c=current_temperature_c,
         temperature_stale=temperature_stale,
         rain_delay_status=rain_delay_status,
+        temperature_status=temperature_status,
     )

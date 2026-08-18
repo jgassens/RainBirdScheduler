@@ -11,6 +11,7 @@ from homeassistant.util import dt as dt_util
 from custom_components.rainbird_scheduler.models import (
     ControllerObservation,
     RainDelayStatus,
+    TemperatureStatus,
 )
 from custom_components.rainbird_scheduler.observations import build_observation
 
@@ -87,6 +88,62 @@ async def test_stale_reading_is_unknown_and_flagged(
     )
     assert observation.current_temperature_c is None
     assert observation.temperature_stale is True
+    assert observation.temperature_status is TemperatureStatus.STALE
+
+
+def _temp_observation(
+    hass: HomeAssistant, entity: str | None = "sensor.t"
+) -> ControllerObservation:
+    return build_observation(
+        hass,
+        zone_entities={},
+        rain_sensor_entity=None,
+        rain_delay_entity=None,
+        temperature_entity=entity,
+        now=dt_util.utcnow(),
+    )
+
+
+async def test_temperature_status_distinguishes_causes(
+    hass: HomeAssistant,
+) -> None:
+    """Each way of not knowing the temperature carries its own status."""
+    # No source configured at all.
+    assert (
+        _temp_observation(hass, entity=None).temperature_status
+        is TemperatureStatus.NO_ENTITY
+    )
+
+    # Configured but absent from the state machine / unavailable.
+    assert (
+        _temp_observation(hass).temperature_status
+        is TemperatureStatus.UNAVAILABLE
+    )
+    hass.states.async_set("sensor.t", "unavailable", {})
+    assert (
+        _temp_observation(hass).temperature_status
+        is TemperatureStatus.UNAVAILABLE
+    )
+
+    # Weather entity present but carrying no temperature attribute.
+    hass.states.async_set("weather.home", "sunny", {})
+    assert (
+        _temp_observation(hass, entity="weather.home").temperature_status
+        is TemperatureStatus.NO_VALUE
+    )
+
+    # Unparsable state.
+    hass.states.async_set("sensor.t", "warm", {"unit_of_measurement": "°C"})
+    assert (
+        _temp_observation(hass).temperature_status
+        is TemperatureStatus.INVALID
+    )
+
+    # Healthy read.
+    hass.states.async_set("sensor.t", "5", {"unit_of_measurement": "°C"})
+    observation = _temp_observation(hass)
+    assert observation.temperature_status is TemperatureStatus.OK
+    assert observation.current_temperature_c == 5
 
 
 @pytest.mark.parametrize("raw", ["inf", "1e400", "-inf", "not-a-number"])
