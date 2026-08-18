@@ -37,7 +37,6 @@ from .const import (
     EVENT_ZONE_COMPLETED,
     EVENT_ZONE_STARTED,
     MAX_COMMAND_ATTEMPTS,
-    OBSERVATION_FRESHNESS_WINDOW_SECONDS,
 )
 from .driver.base import (
     DriverError,
@@ -46,6 +45,7 @@ from .driver.base import (
 )
 from .models import (
     CommandDisposition,
+    CommandType,
     ControllerConfig,
     ControllerObservation,
     ExecutionJournal,
@@ -68,6 +68,11 @@ from .models import (
 
 # Distinguishes the two conditions that share ExecutorState.PAUSED_SENSOR.
 _PAUSE_REASON_FREEZE = "low_temperature"
+
+# Bounded best-effort retries for an uncertain stop while the run is still
+# active (the controller also stops the zone on its own commanded timer, so
+# more than this is noise, not safety).
+_STOP_RETRY_DELAYS_SECONDS = (5, 20)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -177,10 +182,18 @@ class RunExecutor:
         self._lock = asyncio.Lock()
         self._cancel_timer: CancelTimer | None = None
         self._timer_generation = 0
-        # Why RECONCILING was entered: "start" (uncertain command) or
-        # "overrun" (fresh contradictory end evidence). Not persisted; a
-        # restart maps RECONCILING back to the safe start-classification.
+        # Why RECONCILING was entered: "start" (uncertain command),
+        # "overrun" (fresh contradictory end evidence), or "early_end"
+        # (the running zone observed off well before its end). Not
+        # persisted; on restart the current step's result discriminates
+        # instead: a start-context reconcile leaves the step PENDING
+        # (start re-classification is safe), while an end-context
+        # reconcile leaves it RUNNING with actual_start_utc set (the zone
+        # already watered, so recovery confirms against a fresh
+        # observation and never re-sends the start).
         self._reconcile_context: str | None = None
+        self._overrun_confirm_attempts = 0
+        self._stop_retry_attempts = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -272,6 +285,7 @@ class RunExecutor:
         async with self._lock:
             if not self.is_active or self.journal.run_plan is None:
                 return
+            state = self.journal.state
             self._cancel_pending_timer()
             current = self._current_result()
             if current is not None and current.status is StepStatus.RUNNING:
@@ -281,6 +295,15 @@ class RunExecutor:
                     StepStatus.EXTERNAL_STOP,
                     reason,
                 )
+            elif (
+                state is ExecutorState.RECONCILING
+                and current is not None
+                and current.status is StepStatus.PENDING
+            ):
+                # Leaving a start-context reconcile: the uncertain start
+                # may still have been accepted, so send a best-effort
+                # stop (an uncertain stop here must not block the pause).
+                await self._send_stop()
             self.journal.state = ExecutorState.PAUSED_EXTERNAL
             self.journal.paused_reason = reason
             await self._write()
@@ -306,8 +329,17 @@ class RunExecutor:
             current = self._current_result()
             if current is None:
                 return
+            state = self.journal.state
             self._cancel_pending_timer()
             if current.status is StepStatus.RUNNING:
+                await self._send_stop()
+            elif (
+                state is ExecutorState.RECONCILING
+                and current.status is StepStatus.PENDING
+            ):
+                # Leaving a start-context reconcile: the uncertain start
+                # may still have been accepted, so send a best-effort
+                # stop (an uncertain stop here must not block the skip).
                 await self._send_stop()
             self._end_step(
                 self.journal.current_step_index,
@@ -463,6 +495,10 @@ class RunExecutor:
             await self._recover_locked(observation)
         self._notify()
 
+    def shutdown(self) -> None:
+        """Cancel any armed timer; safe to call multiple times."""
+        self._cancel_pending_timer()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -542,11 +578,34 @@ class RunExecutor:
         try:
             await self._driver.async_stop_controller()
             command.disposition = CommandDisposition.SENT
+            self._stop_retry_attempts = 0
         except DriverError as err:
             command.disposition = CommandDisposition.UNCERTAIN
             self.journal.uncertain_count += 1
             _LOGGER.warning("Stop command uncertain: %s", err)
         await self._write()
+        if (
+            command.disposition is CommandDisposition.UNCERTAIN
+            and self.is_active
+            and self._stop_retry_attempts < len(_STOP_RETRY_DELAYS_SECONDS)
+        ):
+            # A genuinely failed stop has no other watchdog once the
+            # caller moves on: retry a bounded number of times while the
+            # run stays active.
+            delay = _STOP_RETRY_DELAYS_SECONDS[self._stop_retry_attempts]
+            self._stop_retry_attempts += 1
+            self._arm_in(delay, self._retry_uncertain_stop)
+
+    async def _retry_uncertain_stop(self) -> None:
+        """Re-send a stop whose last attempt never confirmed."""
+        command = self.journal.pending_command
+        if (
+            command is None
+            or command.command_type is not CommandType.STOP_CONTROLLER
+            or command.disposition is not CommandDisposition.UNCERTAIN
+        ):
+            return
+        await self._send_stop()
 
     # ------------------------------------------------------------------
     # Step lifecycle
@@ -882,6 +941,7 @@ class RunExecutor:
         journal = self.journal
         journal.state = ExecutorState.RECONCILING
         self._reconcile_context = "overrun"
+        self._overrun_confirm_attempts = 0
         await self._write()
         try:
             await self._driver.async_request_observation()
@@ -893,34 +953,60 @@ class RunExecutor:
 
     async def _confirm_overrun(self) -> None:
         journal = self.journal
-        if journal.state is not ExecutorState.RECONCILING:
+        if (
+            journal.state is not ExecutorState.RECONCILING
+            or self._reconcile_context != "overrun"
+        ):
             return
         index = journal.current_step_index
         zone_id = self._current_zone_id()
         expected_end = journal.current_step_expected_end
-        now = self._now()
-        fresh_window = timedelta(seconds=OBSERVATION_FRESHNESS_WINDOW_SECONDS)
-        observation = journal.last_observation
+        # Read the source live rather than trusting the last change event:
+        # the question is whether the zone is on NOW, not at the time some
+        # earlier observation was delivered. A failed read is not fresh
+        # evidence either way: fall back to the last observation (as
+        # _classify_uncertain does) rather than wedge in RECONCILING.
+        observation: ControllerObservation | None
+        try:
+            observation = await self._driver.async_observe()
+            journal.last_observation = observation
+        except DriverError:
+            observation = journal.last_observation
         still_on = (
             zone_id is not None
             and expected_end is not None
             and observation is not None
             and zone_id in observation.active_zone_ids
-            and observation.observed_at_utc >= expected_end
-            and now - observation.observed_at_utc <= fresh_window
         )
         if not still_on:
             await self._complete_step(index, actual_end=expected_end)
             return
+        if self._overrun_confirm_attempts == 0:
+            # A read straight after the expected end can catch the
+            # controller a few seconds from stopping on its own (its timer
+            # starts at command processing, after ours) or a poll carrying
+            # pre-stop data. Demand a second confirmation cycle before
+            # stopping the whole controller.
+            self._overrun_confirm_attempts = 1
+            try:
+                await self._driver.async_request_observation()
+            except DriverError:
+                pass
+            self._arm_in(
+                self._config().overrun_confirmation_seconds,
+                self._confirm_overrun,
+            )
+            return
 
         plan = self._plan()
+        step = plan.steps[index]
         await self._send_stop()
         self._end_step(index, StepStatus.OVERRUN_STOPPED, "controller_overrun")
         self._skip_remaining(SkipReason.EXTERNAL_ACTIVITY, "controller_overrun")
         self._history.record_intervention(
             "controller_overrun",
-            f"Zone {zone_id} remained active past its commanded end; the "
-            "controller was stopped.",
+            f"Zone {step.zone_name!r} remained active past its commanded "
+            "end; the controller was stopped.",
             run_id=plan.run_id,
         )
         self._emit(
@@ -928,6 +1014,67 @@ class RunExecutor:
             {"run_id": plan.run_id, "zone_id": zone_id},
         )
         await self._finish_run(RunOutcome.FAILED, "controller_overrun")
+
+    # ------------------------------------------------------------------
+    # Early-end confirmation (§22)
+    # ------------------------------------------------------------------
+
+    async def _enter_early_end_reconcile(self) -> None:
+        journal = self.journal
+        journal.state = ExecutorState.RECONCILING
+        self._reconcile_context = "early_end"
+        await self._write()
+        try:
+            await self._driver.async_request_observation()
+        except DriverError:
+            pass
+        self._arm_in(
+            self._config().overrun_confirmation_seconds,
+            self._confirm_early_end,
+        )
+
+    async def _confirm_early_end(self) -> None:
+        journal = self.journal
+        if (
+            journal.state is not ExecutorState.RECONCILING
+            or self._reconcile_context != "early_end"
+        ):
+            return
+        index = journal.current_step_index
+        zone_id = self._current_zone_id()
+        # Same fallback as _classify_uncertain: a failed read falls back to
+        # the last observation instead of wedging the run in RECONCILING.
+        observation: ControllerObservation | None
+        try:
+            observation = await self._driver.async_observe()
+            journal.last_observation = observation
+        except DriverError:
+            observation = journal.last_observation
+        if observation is None or (
+            zone_id is not None and zone_id in observation.active_zone_ids
+        ):
+            # The zone is on after a refresh (or no contradicting read is
+            # available at all): the early "off" was stale source data,
+            # not a real stop. Resume the step in place.
+            self._resume_watering_current_step()
+            await self._write()
+            return
+        self._reconcile_context = None
+        await self._classify_early_end(index, observation)
+
+    def _resume_watering_current_step(self) -> None:
+        """Return from an early-end reconcile to WATERING unchanged."""
+        journal = self.journal
+        self._reconcile_context = None
+        journal.state = ExecutorState.WATERING
+        command = journal.pending_command
+        if command is not None and command.disposition is (
+            CommandDisposition.SENT
+        ):
+            command.disposition = CommandDisposition.ACCEPTED
+        expected_end = journal.current_step_expected_end
+        if expected_end is not None:
+            self._arm_at(expected_end, self._on_expected_end)
 
     # ------------------------------------------------------------------
     # Uncertain command handling (§21)
@@ -1013,7 +1160,7 @@ class RunExecutor:
         )
         if external:
             # Different zone active: external conflict.
-            await self._external_conflict(index, external)
+            await self._external_conflict(external)
             return
 
         source_available = (
@@ -1077,6 +1224,14 @@ class RunExecutor:
             ):
                 command.disposition = CommandDisposition.ACCEPTED
                 await self._write()
+            if (
+                journal.state is ExecutorState.RECONCILING
+                and self._reconcile_context == "early_end"
+            ):
+                # Direct evidence the early "off" was stale: resume the step.
+                self._resume_watering_current_step()
+                await self._write()
+                return
             if journal.state is ExecutorState.STARTING or (
                 journal.state is ExecutorState.RECONCILING
                 and self._reconcile_context == "start"
@@ -1092,13 +1247,28 @@ class RunExecutor:
                 journal.step_results[index].status = StepStatus.RUNNING
                 journal.step_results[index].actual_start_utc = start
                 await self._write()
+                self._emit(
+                    EVENT_ZONE_STARTED,
+                    {
+                        "run_id": plan.run_id,
+                        "program_id": plan.program_id,
+                        "zone_id": step.zone_id,
+                        "zone_name": step.zone_name,
+                        "cycle": f"{step.cycle_index}/{step.cycle_count}",
+                        "duration_minutes": step.duration_minutes,
+                    },
+                )
                 self._arm_at(
                     journal.current_step_expected_end, self._on_expected_end
                 )
             return
 
         if is_on and zone_id != current_zone:
-            await self._external_conflict(index, frozenset({zone_id}))
+            # A late poll can carry a cached "on" for the zone that just
+            # finished: apply the same staleness discount _external_zones
+            # gives observations before declaring a conflict.
+            if zone_id in self._external_zones(observation, index):
+                await self._external_conflict(frozenset({zone_id}))
             return
 
         if not is_on and zone_id == current_zone:
@@ -1116,7 +1286,15 @@ class RunExecutor:
                 self._cancel_pending_timer()
                 await self._complete_step(index, actual_end=now)
                 return
-            await self._classify_early_end(index, observation)
+            if observation.rain_sensor_active or not observation.source_available:
+                # The stop arrives with its own explanation: classify now.
+                await self._classify_early_end(index, observation)
+                return
+            # An unexplained early "off" is not trusted: the source polls
+            # a slow controller, so an observation in flight when the zone
+            # was commanded can land afterwards carrying pre-start state.
+            # Ask for a refresh and confirm before classifying (§22).
+            await self._enter_early_end_reconcile()
 
     async def _zone_event_during_gap(
         self, zone_id: str, is_on: bool, observation: ControllerObservation
@@ -1139,7 +1317,7 @@ class RunExecutor:
             await self._enter_overrun_reconcile()
             return
         if zone_id != step.zone_id:
-            await self._external_conflict(index + 1, frozenset({zone_id}))
+            await self._external_conflict(frozenset({zone_id}))
 
     async def _classify_early_end(
         self, index: int, observation: ControllerObservation
@@ -1208,9 +1386,7 @@ class RunExecutor:
         self._skip_remaining(SkipReason.EXTERNAL_ACTIVITY, "external stop")
         await self._finish_run(RunOutcome.ABORTED_EXTERNAL, "external_stop")
 
-    async def _external_conflict(
-        self, upcoming_index: int, zones: frozenset[str]
-    ) -> None:
+    async def _external_conflict(self, zones: frozenset[str]) -> None:
         journal = self.journal
         plan = self._plan()
         program = self._get_program(plan.program_id)
@@ -1270,6 +1446,30 @@ class RunExecutor:
     # Restart recovery (§28)
     # ------------------------------------------------------------------
 
+    async def _complete_or_expire_step(
+        self, index: int, expected_end: datetime, now: datetime
+    ) -> None:
+        """Complete a recovered step past its end, or expire the run."""
+        tolerance = timedelta(
+            minutes=self._config().missed_run_tolerance_minutes
+        )
+        if now - expected_end <= tolerance:
+            await self._complete_step(index, actual_end=expected_end)
+            return
+        self._end_step(
+            index,
+            StepStatus.COMPLETED,
+            SkipReason.RESTART_MISSED_TOLERANCE.value,
+        )
+        self._skip_remaining(
+            SkipReason.RESTART_MISSED_TOLERANCE,
+            "restart after expected completion",
+        )
+        await self._finish_run(
+            RunOutcome.COMPLETED_WITH_SKIPS,
+            SkipReason.RESTART_MISSED_TOLERANCE.value,
+        )
+
     async def _recover_locked(
         self, observation: ControllerObservation | None
     ) -> None:
@@ -1292,19 +1492,19 @@ class RunExecutor:
             if observation is not None
             else frozenset()
         ) - {step.zone_id}
-        tolerance = timedelta(
-            minutes=self._config().missed_run_tolerance_minutes
-        )
+
+        state = journal.state
+        if state is ExecutorState.STOPPING or journal.stop_requested:
+            # A persisted stop request takes precedence over the external
+            # activity check: finish the abort even if another zone looks
+            # active, or the pause would silently undo the stop.
+            self._skip_remaining(SkipReason.USER_STOP, "stop during restart")
+            await self._finish_run(RunOutcome.ABORTED_USER, "user_stop")
+            return
 
         if external:
             journal.state = ExecutorState.PAUSED_EXTERNAL
             await self._write()
-            return
-
-        state = journal.state
-        if state is ExecutorState.STOPPING:
-            self._skip_remaining(SkipReason.USER_STOP, "stop during restart")
-            await self._finish_run(RunOutcome.ABORTED_USER, "user_stop")
             return
 
         if state in (ExecutorState.PAUSED_EXTERNAL, ExecutorState.PAUSED_SENSOR):
@@ -1322,26 +1522,49 @@ class RunExecutor:
                     self._arm_at(expected_end, self._on_expected_end)
                 return
             if expected_end <= now:
-                if now - expected_end <= tolerance:
-                    await self._complete_step(index, actual_end=expected_end)
-                    return
-                self._end_step(
-                    index,
-                    StepStatus.COMPLETED,
-                    SkipReason.RESTART_MISSED_TOLERANCE.value,
-                )
-                self._skip_remaining(
-                    SkipReason.RESTART_MISSED_TOLERANCE,
-                    "restart after expected completion",
-                )
-                await self._finish_run(
-                    RunOutcome.COMPLETED_WITH_SKIPS,
-                    SkipReason.RESTART_MISSED_TOLERANCE.value,
-                )
+                await self._complete_or_expire_step(index, expected_end, now)
                 return
             # Zone idle but the commanded window is still open: trust the
             # commanded clock; the switch may simply be stale.
             self._arm_at(expected_end, self._on_expected_end)
+            return
+
+        current = journal.step_results.get(index)
+        if (
+            state is ExecutorState.RECONCILING
+            and current is not None
+            and current.status is StepStatus.RUNNING
+            and current.actual_start_utc is not None
+        ):
+            # An end-context reconcile (overrun or early end): the step
+            # already ran, so re-sending the start would re-water the
+            # zone. Confirm against a fresh observation instead, mirroring
+            # _confirm_overrun / _confirm_early_end.
+            expected_end = journal.current_step_expected_end
+            if expected_end is None:
+                expected_end = now
+            if observation is None:
+                # No fresh read: restart the confirm loop rather than guess.
+                if expected_end <= now:
+                    await self._enter_overrun_reconcile()
+                else:
+                    await self._enter_early_end_reconcile()
+                return
+            if zone_active:
+                if expected_end <= now:
+                    # Still on past its end: rerun the overrun confirmation.
+                    await self._enter_overrun_reconcile()
+                else:
+                    # The early "off" was stale: resume the commanded clock.
+                    self._resume_watering_current_step()
+                    await self._write()
+                return
+            if expected_end <= now:
+                # Off after the end: the controller stopped on its own.
+                await self._complete_or_expire_step(index, expected_end, now)
+                return
+            # Off before the end: classify the early stop and move on.
+            await self._classify_early_end(index, observation)
             return
 
         if state in (

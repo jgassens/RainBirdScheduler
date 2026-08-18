@@ -105,6 +105,14 @@ def test_occurrences_multiple_start_times_sorted() -> None:
     assert occurrences[0].scheduled_start_local.time() == time(6, 15)
 
 
+def test_duplicate_start_times_dedupe_to_one_occurrence() -> None:
+    program = make_program("twice", ["zone-a"], start=time(9, 0))
+    program.nominal_start_times = [time(9, 0), time(9, 0)]
+    start, end = window(datetime(2026, 6, 1, 0, 0, tzinfo=UTC), days=1)
+    occurrences, _ = occurrences_between(program, TZ, start, end, CREATED)
+    assert len(occurrences) == 1
+
+
 def test_disabled_or_empty_program_yields_nothing() -> None:
     program = make_program("off", ["zone-a"])
     program.enabled = False

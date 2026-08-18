@@ -28,6 +28,12 @@ def _read_decimal(
         return None, None, (
             f"Entity {entity_id} state {state.state!r} is not numeric."
         )
+    if not value.is_finite():
+        # 'nan'/'inf' states (esphome, template sensors) parse fine but
+        # break every downstream calculation; treat them as unusable.
+        return None, None, (
+            f"Entity {entity_id} state {state.state!r} is not finite."
+        )
     reported = getattr(state, "last_reported", None) or state.last_updated
     return value, reported, ""
 
@@ -86,9 +92,10 @@ class EntityPercentProvider:
 class EntityRuntimeProvider:
     """An entity supplies the total calculated runtime in minutes.
 
-    The external total is distributed across the program's zones in
-    proportion to their base runtimes, so relative zone weighting is
-    preserved. The proportionality is stated in the explanation.
+    The external total is distributed across the program's runnable zones
+    (enabled step and enabled zone profile) in proportion to their base
+    runtimes, so relative zone weighting is preserved. The proportionality
+    is stated in the explanation.
     """
 
     def __init__(
@@ -134,7 +141,9 @@ class EntityRuntimeProvider:
                 if step.zone_id == zone.id
                 else (self._get_zone(step.zone_id) if self._get_zone else None)
             )
-            if profile is not None:
+            # Match the snapshot builder: zones whose profile is disabled
+            # never run, so they get no share of the external total.
+            if profile is not None and profile.enabled:
                 base_total += effective_base_minutes(profile, program)
         if base_total <= 0:
             exact = Decimal(0)

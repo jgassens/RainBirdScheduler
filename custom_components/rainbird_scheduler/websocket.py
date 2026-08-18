@@ -108,6 +108,19 @@ def _entity_ids_well_formed(patch: dict[str, Any]) -> bool:
     return True
 
 
+def _freeze_guard_config_valid(patch: dict[str, Any]) -> bool:
+    """Reject enabling the freeze guard without a temperature source.
+
+    Without an entity the guard can never read a temperature; with
+    ``when_unavailable=block_watering`` that misconfiguration blocks watering
+    permanently.
+    """
+    guard = patch.get("freeze_guard")
+    if not isinstance(guard, dict):
+        return True
+    return not (guard.get("enabled") and not guard.get("temperature_entity_id"))
+
+
 def _snapshot(coordinator: SchedulerCoordinator) -> dict[str, Any]:
     journal = coordinator.executor.journal
     active_step = coordinator.active_step()
@@ -221,6 +234,13 @@ async def ws_config_update(
             msg["id"],
             "invalid_config",
             "Expected an entity id like sensor.outdoor_temperature.",
+        )
+        return
+    if not _freeze_guard_config_valid(patch):
+        connection.send_error(
+            msg["id"],
+            "invalid_config",
+            "An enabled freeze guard requires a temperature_entity_id.",
         )
         return
     if "authority_mode" in patch:

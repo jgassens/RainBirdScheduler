@@ -330,6 +330,69 @@ async def test_config_update_rejects_bare_number_entity(
     assert result["error"]["code"] == "invalid_config"
 
 
+async def test_config_update_rejects_enabled_freeze_guard_without_entity(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/config/update",
+            "entry_id": scheduler_entry.entry_id,
+            "expected_revision": 1,
+            "patch": {"freeze_guard": {"enabled": True}},
+        }
+    )
+    result = await client.receive_json()
+    assert not result["success"]
+    assert result["error"]["code"] == "invalid_config"
+    # The stored guard is untouched: still disabled, revision unbumped.
+    assert coordinator.config.controller.freeze_guard.enabled is False
+    assert coordinator.config.controller.revision == 1
+
+
+async def test_config_update_rejects_freeze_guard_entity_cleared(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/config/update",
+            "entry_id": scheduler_entry.entry_id,
+            "expected_revision": 1,
+            "patch": {
+                "freeze_guard": {
+                    "enabled": True,
+                    "temperature_entity_id": None,
+                }
+            },
+        }
+    )
+    result = await client.receive_json()
+    assert not result["success"]
+    assert result["error"]["code"] == "invalid_config"
+
+
+async def test_config_update_allows_disabled_freeze_guard_without_entity(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/config/update",
+            "entry_id": scheduler_entry.entry_id,
+            "expected_revision": 1,
+            "patch": {"freeze_guard": {"enabled": False}},
+        }
+    )
+    result = await client.receive_json()
+    assert result["success"]
+    assert result["result"]["controller"]["freeze_guard"]["enabled"] is False
+
+
 async def test_config_update_conflict_on_stale_revision(
     hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
 ) -> None:
@@ -340,7 +403,12 @@ async def test_config_update_conflict_on_stale_revision(
             "type": f"{DOMAIN}/config/update",
             "entry_id": scheduler_entry.entry_id,
             "expected_revision": 999,
-            "patch": {"freeze_guard": {"enabled": True}},
+            "patch": {
+                "freeze_guard": {
+                    "enabled": True,
+                    "temperature_entity_id": "sensor.outdoor_temperature",
+                }
+            },
         }
     )
     result = await client.receive_json()

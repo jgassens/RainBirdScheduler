@@ -9,7 +9,7 @@ from custom_components.rainbird_scheduler.models import (
     StepStatus,
 )
 
-from .harness import CommandUncertainError, three_zone_rig
+from .harness import CommandUncertainError, DriverError, three_zone_rig
 
 
 async def test_uncertain_then_observed_active_is_accepted_not_resent() -> None:
@@ -120,3 +120,62 @@ async def test_uncertain_with_different_zone_active_is_external() -> None:
     # Default interruption policy pauses rather than fighting for control.
     assert rig.journal().state is ExecutorState.PAUSED_EXTERNAL
     assert len(rig.driver.start_calls) == 1
+
+
+async def test_pause_during_start_reconcile_sends_best_effort_stop() -> None:
+    """The uncertain start may have been accepted: stop before pausing."""
+    rig = three_zone_rig()
+    rig.driver.start_errors = [CommandUncertainError("timeout")]
+    await rig.executor.async_start_run(rig.plan)
+    assert rig.journal().state is ExecutorState.RECONCILING
+
+    await rig.executor.async_pause()
+
+    assert rig.driver.stop_calls == 1
+    journal = rig.journal()
+    assert journal.state is ExecutorState.PAUSED_EXTERNAL
+    assert journal.step_results[0].status is StepStatus.PENDING
+
+
+async def test_skip_during_start_reconcile_sends_best_effort_stop() -> None:
+    """The uncertain start may have been accepted: stop before skipping."""
+    rig = three_zone_rig()
+    rig.driver.start_errors = [CommandUncertainError("timeout")]
+    await rig.executor.async_start_run(rig.plan)
+    assert rig.journal().state is ExecutorState.RECONCILING
+
+    await rig.executor.async_skip_current()
+
+    assert rig.driver.stop_calls == 1
+    journal = rig.journal()
+    assert journal.step_results[0].status is StepStatus.SKIPPED
+    assert journal.state is ExecutorState.INTER_ZONE_GAP
+    await rig.tm.advance(5)
+    assert rig.driver.start_calls[-1][0].station_number == 2
+
+
+async def test_pause_during_start_reconcile_failed_stop_does_not_block() -> None:
+    """An uncertain best-effort stop must not block the pause itself."""
+    rig = three_zone_rig()
+    rig.driver.start_errors = [CommandUncertainError("timeout")]
+    rig.driver.stop_error = DriverError("nope")
+    await rig.executor.async_start_run(rig.plan)
+
+    await rig.executor.async_pause()
+
+    journal = rig.journal()
+    assert journal.state is ExecutorState.PAUSED_EXTERNAL
+    assert journal.pending_command.disposition is CommandDisposition.UNCERTAIN
+
+
+async def test_zone_on_event_during_reconciliation_emits_zone_started() -> None:
+    rig = three_zone_rig()
+    rig.driver.start_errors = [CommandUncertainError("timeout")]
+    await rig.executor.async_start_run(rig.plan)
+    assert rig.journal().state is ExecutorState.RECONCILING
+
+    await rig.tm.advance(5)
+    await rig.zone_event("front-lawn", True)
+
+    assert rig.journal().state is ExecutorState.WATERING
+    assert rig.event_types() == ["run_started", "zone_started"]

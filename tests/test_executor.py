@@ -223,3 +223,17 @@ async def test_expected_end_uses_commanded_duration() -> None:
     await rig.executor.async_start_run(rig.plan)
     journal = rig.journal()
     assert journal.current_step_expected_end == START + timedelta(minutes=12)
+
+
+async def test_shutdown_cancels_armed_timer_and_is_idempotent() -> None:
+    rig = three_zone_rig()
+    await rig.executor.async_start_run(rig.plan)
+    assert rig.tm.pending()  # the expected-end timer is armed
+
+    rig.executor.shutdown()
+    rig.executor.shutdown()  # safe to call repeatedly
+
+    assert rig.tm.pending() == []
+    # Nothing fires afterwards; the journal is left untouched.
+    await rig.tm.advance(15 * 60)
+    assert rig.journal().state is ExecutorState.WATERING

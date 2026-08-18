@@ -98,3 +98,22 @@ def test_occurrence_id_uses_selected_utc_instant() -> None:
     )
     assert len(occurrences) == 1
     assert occurrences[0].occurrence_id.endswith(resolved.isoformat())
+
+
+def test_gap_collapsed_starts_dedupe_to_one_occurrence() -> None:
+    # 02:00 and 02:30 both fall inside the spring-forward gap; both shift to
+    # 03:00 EDT (07:00 UTC). Only one occurrence may survive: duplicate
+    # occurrence ids make the planner merge builds with doubled zone steps.
+    program = make_program("early", ["zone-a"], start=time(2, 0))
+    program.nominal_start_times = [time(2, 0), time(2, 30)]
+    occurrences, _ = occurrences_between(
+        program,
+        NY,
+        datetime(2026, 3, 8, 0, 0, tzinfo=UTC),
+        datetime(2026, 3, 9, 0, 0, tzinfo=UTC),
+        CREATED,
+    )
+    assert len(occurrences) == 1
+    assert occurrences[0].scheduled_start_utc == datetime(
+        2026, 3, 8, 7, 0, tzinfo=UTC
+    )

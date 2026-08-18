@@ -56,7 +56,9 @@ class RainBirdSchedulerConfigFlow(ConfigFlow, domain=DOMAIN):
             self._source = self.hass.config_entries.async_get_entry(
                 user_input["source"]
             )
-            assert self._source is not None
+            if self._source is None:
+                # The chosen entry was removed between render and submit.
+                return self.async_abort(reason="source_unavailable")
             identity = self._source.unique_id or self._source.entry_id
             await self.async_set_unique_id(f"rainbird:{identity}")
             self._abort_if_unique_id_configured()

@@ -193,6 +193,34 @@ def test_watering_window_truncate_last() -> None:
     assert steps[0].planned_end_utc == NINE_AM + timedelta(minutes=10)
 
 
+def test_watering_window_truncate_last_records_dropped_cycles() -> None:
+    zones = [
+        make_zone("a", 1, base_runtime_minutes=Decimal(12), max_cycle_minutes=4)
+    ]
+    program = make_program("p", ["a"])
+    program.watering_window = WateringWindow(
+        start_local=time(9, 0),
+        end_local=time(9, 7),
+        policy=WindowPolicy.TRUNCATE_LAST,
+    )
+    occurrence = make_occurrence(program, NINE_AM)
+    timeline = compile_timeline(
+        make_input(make_controller(), [program], zones, [occurrence])
+    )
+    run = timeline.runs[0]
+    steps = run.steps
+    assert [step.duration_minutes for step in steps] == [4, 2]
+    # The surviving steps agree on the truncated cycle count.
+    assert [step.cycle_index for step in steps] == [1, 2]
+    assert [step.cycle_count for step in steps] == [2, 2]
+    # The third cycle never ran and is recorded, not silently dropped.
+    assert len(run.skipped_zones) == 1
+    skipped = run.skipped_zones[0]
+    assert skipped.zone_id == "a"
+    assert skipped.reason is SkipReason.OUT_OF_WINDOW
+    assert "1 remaining cycle(s)" in skipped.detail
+
+
 def test_watering_window_defer_occurrence_records_conflict() -> None:
     zones = [make_zone("a", 1, base_runtime_minutes=Decimal(12))]
     program = make_program("p", ["a"])
@@ -233,6 +261,25 @@ def test_missed_tolerance_skip_policy_drops_late_occurrence() -> None:
         conflict.reason is SkipReason.MISSED_TOLERANCE
         for conflict in timeline.conflicts
     )
+
+
+def test_missed_tolerance_ignores_requested_offset() -> None:
+    """A requested offset beyond the tolerance is intent, not lateness."""
+    zones = [make_zone("a", 1, base_runtime_minutes=Decimal(10))]
+    program = make_program("p", ["a"])
+    program.zone_steps[0].requested_offset_seconds = 3600
+    program.missed_run_policy = MissedRunPolicy.SKIP
+    occurrence = make_occurrence(program, NINE_AM)
+    timeline = compile_timeline(
+        make_input(make_controller(), [program], zones, [occurrence])
+    )
+    # On an idle controller the step starts exactly at its requested start;
+    # the occurrence is not dropped as MISSED_TOLERANCE.
+    assert not timeline.conflicts
+    assert len(timeline.runs) == 1
+    step = timeline.runs[0].steps[0]
+    assert step.requested_start_utc == NINE_AM + timedelta(seconds=3600)
+    assert step.planned_start_utc == step.requested_start_utc
 
 
 def test_missed_tolerance_run_late_policy_keeps_occurrence() -> None:

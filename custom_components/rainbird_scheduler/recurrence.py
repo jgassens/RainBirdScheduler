@@ -49,12 +49,6 @@ def date_qualifies(rule: RecurrenceRule, day: date) -> bool:
     return False
 
 
-def _is_ambiguous(naive: datetime, tz: tzinfo) -> bool:
-    return naive.replace(tzinfo=tz, fold=0).utcoffset() != naive.replace(
-        tzinfo=tz, fold=1
-    ).utcoffset() and _roundtrips(naive, tz)
-
-
 def _roundtrips(naive: datetime, tz: tzinfo) -> bool:
     local = naive.replace(tzinfo=tz)
     return local.astimezone(UTC).astimezone(tz).replace(tzinfo=None) == naive
@@ -116,6 +110,7 @@ def occurrences_between(
     warnings: list[PlannerWarning] = []
     if not program.enabled or not program.nominal_start_times:
         return occurrences, warnings
+    seen_ids: set[str] = set()
 
     # Pad by a day on each side: a local date's start times can map to UTC
     # instants on the neighboring UTC dates.
@@ -145,9 +140,16 @@ def occurrences_between(
                     continue
                 if not window_start_utc <= utc_start < window_end_utc:
                     continue
+                occurrence_id = make_occurrence_id(program.id, utc_start)
+                # Distinct nominal starts can resolve to the same instant
+                # (e.g. 02:00 and 02:30 both shift to 03:00 across a
+                # spring-forward gap): keep the first, drop the duplicate.
+                if occurrence_id in seen_ids:
+                    continue
+                seen_ids.add(occurrence_id)
                 occurrences.append(
                     ProgramOccurrence(
-                        occurrence_id=make_occurrence_id(program.id, utc_start),
+                        occurrence_id=occurrence_id,
                         program_id=program.id,
                         scheduled_start_utc=utc_start,
                         scheduled_start_local=utc_start.astimezone(tz),

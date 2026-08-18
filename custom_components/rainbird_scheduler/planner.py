@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, tzinfo
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -418,9 +418,32 @@ def _schedule(
                         _apply_window_violation(item, build, conflicts)
                         continue
                     duration = available
-                    # The zone cannot fit its remaining cycles: truncate here
-                    # and drop the rest with a recorded reason.
+                    # The zone cannot fit its remaining cycles: truncate
+                    # here, record the dropped cycles, and correct the
+                    # surviving steps' cycle count.
+                    dropped = len(item.cycles) - 1
+                    if dropped:
+                        build.skipped.append(
+                            SkippedZone(
+                                zone_id=item.zone.id,
+                                zone_name=item.zone.display_name,
+                                reason=SkipReason.OUT_OF_WINDOW,
+                                detail=(
+                                    f"{dropped} remaining cycle(s) could not "
+                                    "start inside the watering window"
+                                ),
+                            )
+                        )
                     item.cycles = deque([duration])
+                    item.cycle_count = item.emitted_cycles + 1
+                    build.steps = [
+                        replace(step, cycle_count=item.cycle_count)
+                        if step.zone_id == item.zone.id
+                        and step.requested_start_utc
+                        == item.requested_start_utc
+                        else step
+                        for step in build.steps
+                    ]
 
         item.cycles.popleft()
         item.emitted_cycles += 1
@@ -499,8 +522,12 @@ def _enforce_lateness(
             continue
         if build.program.missed_run_policy is not MissedRunPolicy.SKIP:
             continue
+        # Lateness is measured from the earliest step's requested start
+        # (occurrence start plus that step's requested offset): the offset is
+        # user intent, not lateness.
         first_start = min(step.planned_start_utc for step in build.steps)
-        latest = build.occurrence.scheduled_start_utc + tolerance
+        first_requested = min(step.requested_start_utc for step in build.steps)
+        latest = first_requested + tolerance
         if first_start > latest:
             build.dropped = True
             build.steps.clear()

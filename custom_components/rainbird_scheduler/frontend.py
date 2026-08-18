@@ -20,8 +20,13 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_register_panel(hass: HomeAssistant) -> None:
-    """Serve the bundled frontend and register one global panel."""
+async def async_register_static_paths(hass: HomeAssistant) -> None:
+    """Serve the bundled frontend; registered once per HA lifetime.
+
+    HA cannot unregister static routes, and the versioned path is harmless
+    while the integration is unloaded — so unlike the sidebar panel, this
+    is never removed (re-registering would raise on the duplicate route).
+    """
     frontend_dir = Path(__file__).parent / "frontend"
     # The version lives in the PATH, not a query string: Safari serves
     # cached ES modules for query-only changes, so each upgrade must produce
@@ -36,6 +41,10 @@ async def async_register_panel(hass: HomeAssistant) -> None:
             )
         ]
     )
+
+
+async def async_register_panel(hass: HomeAssistant) -> None:
+    """Register the one global sidebar panel."""
     frontend.async_register_built_in_panel(
         hass,
         component_name="custom",
@@ -47,7 +56,9 @@ async def async_register_panel(hass: HomeAssistant) -> None:
                 "name": "rainbird-scheduler-panel",
                 "embed_iframe": False,
                 "trust_external": False,
-                "module_url": f"{static_url}/panel.js",
+                "module_url": (
+                    f"{FRONTEND_STATIC_URL}/{INTEGRATION_VERSION}/panel.js"
+                ),
             }
         },
         require_admin=True,

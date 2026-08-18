@@ -5,7 +5,7 @@ from __future__ import annotations
 DOMAIN = "rainbird_scheduler"
 SOURCE_DOMAIN = "rainbird"
 
-INTEGRATION_VERSION = "0.3.1"
+INTEGRATION_VERSION = "0.4.0"
 
 # Config entry data keys.
 CONF_SOURCE_CONFIG_ENTRY_ID = "source_config_entry_id"
@@ -65,9 +65,9 @@ HISTORY_MAX_RUNS = 250
 HISTORY_MAX_ZONE_RECORDS = 2000
 HISTORY_MAX_INTERVENTIONS = 500
 
-# Occurrence deduplication window.
+# Occurrence deduplication window: the journal keeps the most recent
+# finished occurrences and trims by count only, never by age.
 DEDUP_MAX_OCCURRENCES = 500
-DEDUP_RETENTION_DAYS = 30
 
 # How far ahead the planner compiles candidate occurrences.
 PLAN_HORIZON_DAYS = 7
@@ -95,10 +95,7 @@ LIFECYCLE_EVENT_TYPES = [
     EVENT_CONTROLLER_OVERRUN,
 ]
 
-# Dispatcher signals (formatted with the config entry id).
-SIGNAL_STATE_UPDATED = f"{DOMAIN}_state_updated_{{}}"
-SIGNAL_CONFIG_UPDATED = f"{DOMAIN}_config_updated_{{}}"
-SIGNAL_HISTORY_UPDATED = f"{DOMAIN}_history_updated_{{}}"
+# Dispatcher signals are defined in coordinator.py next to their consumers.
 
 # Frontend panel.
 PANEL_URL_PATH = "rainbird-scheduler"

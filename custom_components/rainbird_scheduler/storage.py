@@ -44,20 +44,47 @@ _LOGGER = logging.getLogger(__name__)
 HISTORY_SAVE_DELAY_SECONDS = 10.0
 
 
+class _MigratingStore(Store[dict[str, Any]]):
+    """Store that starts fresh on an un-migratable version mismatch.
+
+    HA's default migration raises ``NotImplementedError`` when the stored
+    major version differs (e.g. downgrading across a version bump), which
+    would fail setup. Returning ``None`` discards the old payload instead,
+    mirroring the corruption fallbacks below.
+    """
+
+    async def _async_migrate_func(
+        self,
+        old_major_version: int,
+        old_minor_version: int,
+        old_data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if old_major_version != self.version:
+            _LOGGER.error(
+                "Cannot migrate %s from storage version %s to %s; "
+                "starting fresh",
+                self.key,
+                old_major_version,
+                self.version,
+            )
+            return None
+        return old_data
+
+
 class SchedulerStorage:
     """Owns the three stores for one scheduler config entry."""
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
-        self._config_store: Store[dict[str, Any]] = Store(
+        self._config_store: Store[dict[str, Any]] = _MigratingStore(
             hass, STORAGE_VERSION_CONFIG, config_store_key(entry_id)
         )
-        self._journal_store: Store[dict[str, Any]] = Store(
+        self._journal_store: Store[dict[str, Any]] = _MigratingStore(
             hass,
             STORAGE_VERSION_JOURNAL,
             journal_store_key(entry_id),
             atomic_writes=True,
         )
-        self._history_store: Store[dict[str, Any]] = Store(
+        self._history_store: Store[dict[str, Any]] = _MigratingStore(
             hass, STORAGE_VERSION_HISTORY, history_store_key(entry_id)
         )
         self._journal_lock = asyncio.Lock()

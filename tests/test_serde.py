@@ -256,3 +256,19 @@ def test_observation_roundtrips_temperature() -> None:
     loaded = serde.load(ControllerObservation, serde.dump(observation))
     assert loaded.current_temperature_c == Decimal("-3.5")
     assert loaded.temperature_stale is True
+
+
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "abc"])
+def test_bare_decimal_rejects_non_finite_and_garbage(raw: str) -> None:
+    # InvalidOperation is an ArithmeticError, not a ValueError: if serde
+    # leaked it, pytest.raises(ValueError) would not catch it here.
+    with pytest.raises(ValueError):
+        serde.load(Decimal, raw)
+
+
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "abc"])
+def test_decimal_field_rejects_non_finite_and_garbage(raw: str) -> None:
+    data = serde.dump(make_zone("zone-a", 1))
+    data["base_runtime_minutes"] = raw
+    with pytest.raises(ValueError, match="base_runtime_minutes"):
+        serde.load(ZoneProfile, data)

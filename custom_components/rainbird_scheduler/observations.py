@@ -108,7 +108,8 @@ def build_observation(
             assert state is not None
             try:
                 rain_delay_days = int(float(state.state))
-            except ValueError:
+            except (ValueError, OverflowError):
+                # 'inf'/'1e400' overflow the int conversion.
                 rain_delay_days = None
 
     current_temperature_c: Decimal | None = None

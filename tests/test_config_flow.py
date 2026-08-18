@@ -86,3 +86,25 @@ async def test_already_attached_controller_not_offered(
     )
     assert result["type"] == "abort"
     assert result["reason"] == "no_controllers"
+
+
+async def test_source_removed_before_submit_aborts(
+    hass: HomeAssistant, source_entry: MockConfigEntry
+) -> None:
+    """The chosen Rain Bird entry can disappear between render and submit."""
+    # A second controller keeps the sources list non-empty, so the flow
+    # reaches the deleted entry lookup instead of the no_controllers abort.
+    other = MockConfigEntry(domain="rainbird", title="Other", unique_id="o")
+    other.add_to_hass(hass)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": "user"}
+    )
+    assert result["type"] == "form"
+
+    await hass.config_entries.async_remove(source_entry.entry_id)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"source": source_entry.entry_id}
+    )
+    assert result["type"] == "abort"
+    assert result["reason"] == "source_unavailable"

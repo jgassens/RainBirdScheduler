@@ -10,6 +10,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from custom_components.rainbird_scheduler.models import (
+    CommandDisposition,
     ExecutorState,
     FreezeGuardConfig,
     FreezeUnavailablePolicy,
@@ -19,7 +20,7 @@ from custom_components.rainbird_scheduler.models import (
     StepStatus,
 )
 
-from .harness import build_rig
+from .harness import DriverError, build_rig
 from .helpers import make_controller, make_program, make_zone
 
 
@@ -213,3 +214,45 @@ async def test_block_when_unavailable_stops_at_pre_step() -> None:
     assert rig.journal().state is ExecutorState.IDLE
     assert rig.history.finished[0][1] is RunOutcome.ABORTED_SENSOR
     assert len(rig.driver.start_calls) == 1
+
+
+async def test_uncertain_freeze_cut_stop_retries_until_confirmed() -> None:
+    """A failed cut stop has a watchdog: retry while the run stays paused."""
+    rig = freeze_rig(SensorCutBehavior.PAUSE_UNTIL_DRY)
+    rig.driver.stop_error = DriverError("nope")
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(3 * 60)
+
+    await rig.weather_event(temperature_c=Decimal(0))
+    assert rig.journal().state is ExecutorState.PAUSED_SENSOR
+    assert rig.driver.stop_calls == 1
+    assert (
+        rig.journal().pending_command.disposition is CommandDisposition.UNCERTAIN
+    )
+
+    # The first retry fires 5s later and confirms the stop.
+    rig.driver.stop_error = None
+    await rig.tm.advance(5)
+    assert rig.driver.stop_calls == 2
+    assert rig.journal().pending_command.disposition is CommandDisposition.SENT
+
+    # No further retries once the stop confirmed.
+    await rig.tm.advance(60)
+    assert rig.driver.stop_calls == 2
+
+
+async def test_uncertain_stop_retry_is_bounded() -> None:
+    rig = freeze_rig(SensorCutBehavior.PAUSE_UNTIL_DRY)
+    rig.driver.stop_error = DriverError("nope")
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(3 * 60)
+    await rig.weather_event(temperature_c=Decimal(0))
+
+    await rig.tm.advance(5)
+    assert rig.driver.stop_calls == 2
+    await rig.tm.advance(20)
+    assert rig.driver.stop_calls == 3
+    # The retry budget is exhausted: no more attempts, no timer pending.
+    await rig.tm.advance(120)
+    assert rig.driver.stop_calls == 3
+    assert rig.tm.pending() == []

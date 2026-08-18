@@ -188,6 +188,35 @@ async def test_stopping_state_finishes_abort() -> None:
     assert rig.history.finished[0][1] is RunOutcome.ABORTED_USER
 
 
+async def test_stopping_state_finishes_abort_despite_external_zone() -> None:
+    """A persisted stop takes precedence over external-activity pausing."""
+    rig = three_zone_rig()
+    rig.tm.now = START + timedelta(minutes=5)
+    _prime_active_run(rig, ExecutorState.STOPPING, started_minutes_ago=5)
+    rig.driver.set_observation({"back-lawn"})
+
+    await rig.executor.async_recover()
+
+    assert rig.journal().state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.ABORTED_USER
+
+
+async def test_persisted_stop_request_finishes_abort_despite_external() -> None:
+    """A journal persisted mid-async_stop still finishes the abort."""
+    rig = three_zone_rig()
+    rig.tm.now = START + timedelta(minutes=5)
+    _prime_active_run(rig, ExecutorState.WATERING, started_minutes_ago=5)
+    rig.journal().stop_requested = True
+    rig.driver.set_observation({"back-lawn"})
+
+    await rig.executor.async_recover()
+
+    journal = rig.journal()
+    assert journal.state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.ABORTED_USER
+    assert journal.stop_requested is False
+
+
 async def test_recovered_occurrence_not_run_twice() -> None:
     rig = three_zone_rig()
     rig.tm.now = START + timedelta(minutes=90)
@@ -205,3 +234,119 @@ async def test_recovered_occurrence_not_run_twice() -> None:
 
     with pytest.raises(DuplicateOccurrenceError):
         await rig.executor.async_start_run(rig.plan)
+
+
+async def test_reconciling_end_context_zone_on_before_end_resumes() -> None:
+    """Restart mid early-end reconcile with the zone on: resume the step.
+
+    The step is already RUNNING with an actual start, so recovery must
+    never re-send the start command (that would re-water the zone).
+    """
+    rig = three_zone_rig()
+    rig.tm.now = START + timedelta(minutes=5)
+    _prime_active_run(rig, ExecutorState.RECONCILING, started_minutes_ago=5)
+    rig.driver.set_observation({"front-lawn"})
+
+    await rig.executor.async_recover()
+
+    journal = rig.journal()
+    assert journal.state is ExecutorState.WATERING
+    assert journal.step_results[0].status is StepStatus.RUNNING
+    assert rig.driver.start_calls == []
+    assert rig.tm.pending() == [START + timedelta(minutes=12)]
+
+    # The step completes on its original commanded clock.
+    await rig.tm.advance(8 * 60)
+    assert rig.journal().step_results[0].status is StepStatus.COMPLETED
+
+
+async def test_reconciling_end_context_zone_on_past_end_confirms_overrun() -> None:
+    """Restart mid overrun reconcile with the zone still on past its end."""
+    rig = three_zone_rig()
+    rig.tm.now = START + timedelta(minutes=14)  # end was the 12-minute mark
+    _prime_active_run(rig, ExecutorState.RECONCILING, started_minutes_ago=14)
+    rig.driver.set_observation({"front-lawn"})
+
+    await rig.executor.async_recover()
+
+    # No re-start: recovery re-enters the overrun confirmation instead.
+    assert rig.driver.start_calls == []
+    assert rig.journal().state is ExecutorState.RECONCILING
+
+    # Still on at the first confirmation: a second cycle is required.
+    await rig.tm.advance(31)
+    assert rig.journal().state is ExecutorState.RECONCILING
+    assert rig.driver.stop_calls == 0
+
+    # Still on at the second confirmation: stop the controller, fail run.
+    await rig.tm.advance(31)
+    assert rig.journal().state is ExecutorState.IDLE
+    assert rig.driver.stop_calls == 1
+    assert rig.history.finished[0][1] is RunOutcome.FAILED
+    assert rig.history.finished[0][2] == "controller_overrun"
+    results = rig.final_step_results()
+    assert results["0"]["status"] == StepStatus.OVERRUN_STOPPED.value
+
+
+async def test_reconciling_end_context_zone_off_past_end_completes() -> None:
+    """Restart mid overrun reconcile with the zone off: it stopped alone."""
+    rig = three_zone_rig()
+    rig.tm.now = START + timedelta(minutes=14)
+    _prime_active_run(rig, ExecutorState.RECONCILING, started_minutes_ago=14)
+    rig.driver.set_observation(set())
+
+    await rig.executor.async_recover()
+
+    journal = rig.journal()
+    assert journal.step_results[0].status is StepStatus.COMPLETED
+    assert rig.driver.start_calls == []
+    # The run advances to the next zone after the gap.
+    await rig.tm.advance(10)
+    assert [call[0].station_number for call in rig.driver.start_calls] == [2]
+
+
+async def test_reconciling_end_context_zone_off_past_tolerance_expires() -> None:
+    """Restart long after the end with the zone off: expire, don't re-run."""
+    rig = three_zone_rig()
+    rig.tm.now = START + timedelta(minutes=90)
+    _prime_active_run(rig, ExecutorState.RECONCILING, started_minutes_ago=90)
+    rig.driver.set_observation(set())
+
+    await rig.executor.async_recover()
+
+    assert rig.driver.start_calls == []
+    assert rig.journal().state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.COMPLETED_WITH_SKIPS
+    assert rig.history.finished[0][2] == (
+        SkipReason.RESTART_MISSED_TOLERANCE.value
+    )
+
+
+async def test_reconciling_end_context_zone_off_before_end_classifies() -> None:
+    """Restart mid early-end reconcile with the zone off: classify the stop."""
+    rig = three_zone_rig()
+    rig.tm.now = START + timedelta(minutes=5)
+    _prime_active_run(rig, ExecutorState.RECONCILING, started_minutes_ago=5)
+    rig.driver.set_observation(set())
+
+    await rig.executor.async_recover()
+
+    assert rig.driver.start_calls == []
+    assert rig.journal().state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.ABORTED_EXTERNAL
+    results = rig.final_step_results()
+    assert results["0"]["status"] == StepStatus.EXTERNAL_STOP.value
+
+
+async def test_reconciling_start_context_idle_still_retries() -> None:
+    """A start-context reconcile (step still PENDING) keeps the old path."""
+    rig = three_zone_rig()
+    _prime_active_run(rig, ExecutorState.RECONCILING)
+    rig.tm.now = START + timedelta(minutes=2)
+    rig.driver.set_observation(set())
+
+    await rig.executor.async_recover()
+
+    # The controller was observed idle: re-issuing the start is safe.
+    assert [call[0].station_number for call in rig.driver.start_calls] == [1]
+    assert rig.journal().state is ExecutorState.WATERING

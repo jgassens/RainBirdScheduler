@@ -8,6 +8,7 @@ executor state machine.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import uuid
@@ -56,6 +57,7 @@ from .models import (
     ControllerObservation,
     EntityReference,
     ExecutorState,
+    MissedRunPolicy,
     Program,
     ProgramOccurrence,
     ProgramZoneStep,
@@ -140,6 +142,17 @@ class SchedulerCoordinator:
         self._ephemeral_programs: dict[str, Program] = {}
         self._occurrence_index: dict[str, ProgramOccurrence] = {}
         self._new_zone_found = False
+        # Occurrences owned by the launch-retry loop (transient block or
+        # controller busy); the normal arming path must not double-arm them.
+        self._retry_occurrences: dict[str, ProgramOccurrence] = {}
+        # What the occurrence timer is currently armed for, so re-arming the
+        # same launch instant keeps the live timer instead of churning it.
+        self._armed_occurrence_id: str | None = None
+        self._armed_when: datetime | None = None
+        # Fire-and-forget tasks (recalculates, journal writes, launches),
+        # tracked so shutdown can stop them before they re-arm anything.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._shutdown = False
 
     # ------------------------------------------------------------------
     # Setup / teardown
@@ -210,17 +223,32 @@ class SchedulerCoordinator:
         )
 
         await self.executor.async_recover()
-        # A run paused for a sensor/freeze condition that cleared while HA was
-        # down would otherwise wait for the next state-change event; nudge it
-        # with a fresh reading so it resumes (or expires) promptly.
-        if self.executor.journal.state is ExecutorState.PAUSED_SENSOR:
+        # A run whose pause cause cleared while HA was down would otherwise
+        # wait for the next state-change event; nudge it with a fresh
+        # reading so it resumes (or expires) promptly. User pauses carry a
+        # paused_reason and are never auto-resumed here.
+        journal = self.executor.journal
+        if journal.state is ExecutorState.PAUSED_SENSOR:
             await self.executor.async_handle_weather_state(
                 self.build_observation()
             )
+        elif (
+            journal.state is ExecutorState.PAUSED_EXTERNAL
+            and journal.paused_reason is None
+        ):
+            step = self.active_step()
+            if step is not None:
+                observation = self.build_observation()
+                await self.executor.async_handle_zone_state(
+                    step.zone_id,
+                    step.zone_id in observation.active_zone_ids,
+                    observation,
+                )
         await self.async_recalculate()
 
     async def async_shutdown(self) -> None:
-        """Unload path (§11.4): stop timers, snapshot, then release."""
+        """Unload path (§11.4): stop timers and tracked tasks, snapshot."""
+        self._shutdown = True
         for unsub in (
             self._unsub_state,
             self._unsub_registry,
@@ -233,9 +261,30 @@ class SchedulerCoordinator:
         self._unsub_registry = None
         self._unsub_occurrence = None
         self._unsub_retry = None
+        # The executor's armed timer must not outlive the coordinator: an
+        # orphaned executor would keep issuing commands while the next
+        # setup recovers the same journal.
+        if self.executor is not None:
+            self.executor.shutdown()
+        # In-flight fire-and-forget work (recalculates, journal writes,
+        # launches) must not re-arm timers or write after unload.
+        tasks = tuple(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.storage.async_flush(
             self.executor.journal, self.history.history
         )
+
+    def _track_background(self, coro: Coroutine[Any, Any, None]) -> None:
+        """Run ``coro`` fire-and-forget, tracked so shutdown can stop it."""
+        if self._shutdown:
+            coro.close()
+            return
+        task = self.hass.async_create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def async_remove(self) -> None:
         await self.storage.async_remove()
@@ -503,7 +552,12 @@ class SchedulerCoordinator:
         # Re-resolve everything; renames and removals must reflect promptly.
         self._discover_sources()
         self._subscribe_states()
-        self._notify_state()
+        if self._discovered_new_zones():
+            # A zone discovered after setup would otherwise get a fresh
+            # random id on every restart until some unrelated CRUD write.
+            await self._persist_config()
+        else:
+            self._notify_state()
 
     @property
     def native_schedule_conflict(self) -> bool:
@@ -562,8 +616,8 @@ class SchedulerCoordinator:
         # Start the horizon at the top of today (local) rather than "now" so
         # occurrences that have already run today stay in the compiled
         # timeline — the panel dims them instead of dropping the whole row to
-        # "no watering". next_pending_run and the arming path skip anything
-        # already past, so a wider window never re-fires an elapsed run.
+        # "no watering". next_pending_run gates on each run's launch
+        # deadline, so a wider window never re-fires an elapsed run.
         window_start = dt_util.as_utc(dt_util.start_of_local_day())
         window_end = now + timedelta(days=PLAN_HORIZON_DAYS)
 
@@ -600,6 +654,37 @@ class SchedulerCoordinator:
         self._arm_next_occurrence()
         self._notify_state()
 
+    @staticmethod
+    def _planned_launch(run: RunPlan) -> datetime:
+        """Earliest planned step start — the delay-and-preserve launch time.
+
+        The planner deliberately pushes overlapping runs past their nominal
+        requested start; the compiled timeline, not the request, is when the
+        controller can actually take the run.
+        """
+        return min(
+            (step.planned_start_utc for step in run.steps),
+            default=run.requested_start_utc,
+        )
+
+    def _launch_deadline(self, run: RunPlan) -> datetime:
+        """Latest instant the run may still launch (missed-run policy).
+
+        RUN_LATE tolerates lateness against the planned start; SKIP must
+        begin within tolerance of the requested time (the planner already
+        enforces that at compile time, so this gate matches its intent).
+        """
+        tolerance = timedelta(
+            minutes=self.config.controller.missed_run_tolerance_minutes
+        )
+        program = self.config.programs.get(run.program_id)
+        if (
+            program is not None
+            and program.missed_run_policy is MissedRunPolicy.SKIP
+        ):
+            return run.requested_start_utc + tolerance
+        return self._planned_launch(run) + tolerance
+
     def next_pending_run(self) -> RunPlan | None:
         journal = self.executor.journal if self.executor else None
         completed = journal.completed_occurrences if journal else {}
@@ -610,39 +695,122 @@ class SchedulerCoordinator:
                 continue
             if run.occurrence_id in completed or run.occurrence_id == active:
                 continue
-            # Today's already-elapsed occurrences now live in the timeline for
-            # display; they are not candidates to arm or report as "next".
-            if run.requested_start_utc < now:
+            if run.occurrence_id in self._retry_occurrences:
+                # Owned by the launch-retry loop; never double-arm it.
+                continue
+            # Today's already-elapsed occurrences live in the timeline for
+            # display and stay launchable until their missed-run deadline;
+            # the arming path records a proper skip once that passes.
+            if now > self._launch_deadline(run):
                 continue
             return run
         return None
 
+    def _expire_stale_occurrences(self) -> None:
+        """Record MISSED_TOLERANCE skips for occurrences past their deadline.
+
+        Elapsed runs stay in the timeline for display and late launching;
+        once the launch deadline passes they would otherwise vanish from
+        every view with no run, skip record, or history.
+        """
+        journal = self.executor.journal
+        now = dt_util.utcnow()
+        for run in self.timeline.runs:
+            if not run.steps:
+                continue
+            if (
+                run.occurrence_id in journal.completed_occurrences
+                or run.occurrence_id == journal.active_occurrence_id
+            ):
+                continue
+            occurrence = self._occurrence_index.get(run.occurrence_id)
+            program = self.config.programs.get(run.program_id)
+            if occurrence is None or program is None:
+                continue
+            if now <= self._launch_deadline(run):
+                continue
+            self._retry_occurrences.pop(run.occurrence_id, None)
+            self._record_occurrence_skip(
+                occurrence, program, SkipReason.MISSED_TOLERANCE
+            )
+
     def _arm_next_occurrence(self) -> None:
-        if self._unsub_occurrence is not None:
-            self._unsub_occurrence()
-            self._unsub_occurrence = None
-        if not self.config.controller.enabled:
-            return
+        """(Re)arm the one-shot launch timer for the next pending run.
+
+        Re-arming is idempotent: when the already-armed occurrence is still
+        next at the same instant, the live timer is kept. Blind
+        cancel-and-re-arm churns the handle on every recalculate and can
+        swallow a launch when a retry re-arms while the occurrence timer is
+        already in flight.
+        """
+        run: RunPlan | None = None
         if (
-            self.config.controller.authority_mode
-            is AuthorityMode.NATIVE_AUTHORITATIVE
+            self.config.controller.enabled
+            and self.config.controller.authority_mode
+            is not AuthorityMode.NATIVE_AUTHORITATIVE
+        ):
+            self._expire_stale_occurrences()
+            run = self.next_pending_run()
+        occurrence = (
+            self._occurrence_index.get(run.occurrence_id)
+            if run is not None
+            else None
+        )
+        if run is None or occurrence is None:
+            self._disarm_occurrence()
+            return
+        # Arm at the planned start, not the nominal requested start: an
+        # occurrence the planner delayed behind another run must not fire
+        # into a busy controller and burn its missed-run tolerance.
+        when = max(self._planned_launch(run), dt_util.utcnow())
+        if (
+            self._unsub_occurrence is not None
+            and self._armed_occurrence_id == occurrence.occurrence_id
+            and self._armed_when == when
         ):
             return
-        run = self.next_pending_run()
-        if run is None:
-            return
-        occurrence = self._occurrence_index.get(run.occurrence_id)
-        if occurrence is None:
-            return
-        when = max(run.requested_start_utc, dt_util.utcnow())
+        self._disarm_occurrence()
+        self._armed_occurrence_id = occurrence.occurrence_id
+        self._armed_when = when
 
         @callback
         def _fire(_now: datetime) -> None:
             self._unsub_occurrence = None
-            self.hass.async_create_task(self._launch_occurrence(occurrence))
+            self._armed_occurrence_id = None
+            self._armed_when = None
+            self._track_background(self._launch_occurrence(occurrence))
 
         self._unsub_occurrence = async_track_point_in_utc_time(
             self.hass, _fire, when
+        )
+
+    def _disarm_occurrence(self) -> None:
+        if self._unsub_occurrence is not None:
+            self._unsub_occurrence()
+            self._unsub_occurrence = None
+        self._armed_occurrence_id = None
+        self._armed_when = None
+
+    def _occurrence_launch_deadline(
+        self, occurrence: ProgramOccurrence
+    ) -> datetime:
+        """Latest launch instant, taken from the occurrence's timeline run.
+
+        The full timeline carries the delay-and-preserve planned start; if
+        the occurrence is no longer in it, fall back to the requested start.
+        """
+        timeline_run = next(
+            (
+                run
+                for run in self.timeline.runs
+                if run.occurrence_id == occurrence.occurrence_id
+            ),
+            None,
+        )
+        if timeline_run is not None:
+            return self._launch_deadline(timeline_run)
+        return occurrence.scheduled_start_utc + timedelta(
+            minutes=self.config.controller.missed_run_tolerance_minutes
         )
 
     async def _launch_occurrence(self, occurrence: ProgramOccurrence) -> None:
@@ -651,7 +819,13 @@ class SchedulerCoordinator:
             await self.async_recalculate()
             return
         journal = self.executor.journal
-        if occurrence.occurrence_id in journal.completed_occurrences:
+        if (
+            occurrence.occurrence_id in journal.completed_occurrences
+            or occurrence.occurrence_id == journal.active_occurrence_id
+        ):
+            # Already finished or mid-run: a stale duplicate arm must not
+            # re-launch (its own active zone would read as external
+            # activity and park it in the retry loop).
             await self.async_recalculate()
             return
 
@@ -660,15 +834,10 @@ class SchedulerCoordinator:
         blocked = evaluate_preconditions(
             self.config.controller, program, observation, manual=False
         )
-        tolerance = timedelta(
-            minutes=self.config.controller.missed_run_tolerance_minutes
-        )
         now = dt_util.utcnow()
+        deadline = self._occurrence_launch_deadline(occurrence)
         if blocked is not None:
-            if (
-                blocked.transient
-                and now <= occurrence.scheduled_start_utc + tolerance
-            ):
+            if blocked.transient and now <= deadline:
                 self._arm_launch_retry(occurrence)
                 return
             self._record_occurrence_skip(occurrence, program, blocked.reason)
@@ -700,7 +869,9 @@ class SchedulerCoordinator:
         try:
             await self.executor.async_start_run(timeline.runs[0])
         except ControllerBusyError:
-            if now <= occurrence.scheduled_start_utc + tolerance:
+            # Genuinely external busy (e.g. a manual run started after the
+            # timeline was compiled): retry within the launch deadline.
+            if now <= deadline:
                 self._arm_launch_retry(occurrence)
                 return
             self._record_occurrence_skip(
@@ -711,17 +882,29 @@ class SchedulerCoordinator:
         await self.async_recalculate()
 
     def _arm_launch_retry(self, occurrence: ProgramOccurrence) -> None:
-        if self._unsub_retry is not None:
-            self._unsub_retry()
+        """Retry a transiently blocked launch; keep later runs on schedule.
 
-        @callback
-        def _retry(_now: datetime) -> None:
-            self._unsub_retry = None
-            self.hass.async_create_task(self._launch_occurrence(occurrence))
+        One retry timer serves all blocked occurrences: the earliest pass
+        re-attempts each of them, so a second blocked occurrence never
+        cancels the first one's retry (and vice versa).
+        """
+        self._retry_occurrences[occurrence.occurrence_id] = occurrence
+        if self._unsub_retry is None:
 
-        self._unsub_retry = async_call_later(
-            self.hass, LAUNCH_RETRY_SECONDS, _retry
-        )
+            @callback
+            def _retry(_now: datetime) -> None:
+                self._unsub_retry = None
+                due = list(self._retry_occurrences.values())
+                self._retry_occurrences.clear()
+                for pending in due:
+                    self._track_background(self._launch_occurrence(pending))
+
+            self._unsub_retry = async_call_later(
+                self.hass, LAUNCH_RETRY_SECONDS, _retry
+            )
+        # A later occurrence may come due while this one waits out its
+        # retry; make sure the normal arming path covers it.
+        self._arm_next_occurrence()
 
     def _record_occurrence_skip(
         self,
@@ -751,7 +934,7 @@ class SchedulerCoordinator:
                 "reason": reason.value,
             },
         )
-        self.hass.async_create_task(
+        self._track_background(
             self.storage.async_write_journal_now(journal)
         )
 
@@ -836,11 +1019,6 @@ class SchedulerCoordinator:
                 honor_native_delay=False, skip_when_sensor_wet=False
             ),
         )
-        self._ephemeral_programs[program.id] = program
-        if len(self._ephemeral_programs) > 5:
-            oldest = next(iter(self._ephemeral_programs))
-            del self._ephemeral_programs[oldest]
-
         occurrence = ProgramOccurrence(
             occurrence_id=f"{program.id}:{now.isoformat()}",
             program_id=program.id,
@@ -864,9 +1042,35 @@ class SchedulerCoordinator:
         )
         if not timeline.runs or not timeline.runs[0].steps:
             raise HomeAssistantError("No executable zones in the request")
+        self._ephemeral_programs[program.id] = program
+        # Never evict the program an active run is executing: _get_program
+        # falls back to the controller default rain policy for a missing
+        # id, silently re-enabling the rain checks this run disabled.
+        active_plan = self.executor.journal.run_plan
+        active_program = (
+            active_plan.program_id if active_plan is not None else None
+        )
+        while len(self._ephemeral_programs) > 5:
+            victim = next(
+                (
+                    program_id
+                    for program_id in self._ephemeral_programs
+                    if program_id != active_program
+                ),
+                None,
+            )
+            if victim is None:
+                break
+            del self._ephemeral_programs[victim]
         journal = self.executor.journal
         journal.last_observation = self.build_observation()
-        await self.executor.async_start_run(timeline.runs[0])
+        try:
+            await self.executor.async_start_run(timeline.runs[0])
+        except Exception:
+            # A run that never started must not keep its program; failed
+            # attempts would otherwise pile up and evict a live one.
+            self._ephemeral_programs.pop(program.id, None)
+            raise
         self._notify_state()
 
     async def async_set_rain_delay(self, days: int) -> None:
@@ -1003,7 +1207,7 @@ class SchedulerCoordinator:
             data,
         )
         if event_type in _RUN_TERMINAL_EVENTS:
-            self.hass.async_create_task(self.async_recalculate())
+            self._track_background(self.async_recalculate())
 
     def _notify_state(self) -> None:
         async_dispatcher_send(

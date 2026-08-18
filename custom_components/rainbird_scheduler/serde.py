@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import types
 from datetime import date, datetime, time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import cache
 from typing import (
@@ -151,7 +151,15 @@ def load(target: Any, data: Any) -> Any:
         if target is time:
             return time.fromisoformat(data)
         if target is Decimal:
-            return Decimal(str(data))
+            try:
+                value = Decimal(str(data))
+            except InvalidOperation as err:
+                # InvalidOperation is an ArithmeticError, not a ValueError;
+                # convert so callers' ValueError handling sees bad input.
+                raise ValueError(f"{data!r} is not a valid decimal") from err
+            if not value.is_finite():
+                raise ValueError(f"{data!r} is not a finite decimal")
+            return value
         if target is bool:
             return bool(data)
         if target is int:

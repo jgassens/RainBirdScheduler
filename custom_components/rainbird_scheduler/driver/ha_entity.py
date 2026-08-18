@@ -105,6 +105,13 @@ class HomeAssistantEntityDriver:
             )
         except HomeAssistantError as err:
             raise CommandUncertainError(str(err)) from err
+        except Exception as err:
+            # The source integration can leak non-HA errors out of the
+            # service call (aiohttp total timeouts, pyrainbird decode
+            # errors). The executor only handles DriverError, and an
+            # unhandled exception would strand the journal with no timers
+            # armed; treat the outcome as uncertain and reconcile.
+            raise CommandUncertainError(str(err)) from err
         _LOGGER.debug(
             "Started %s for %s min (command %s)",
             entity_id,
@@ -128,6 +135,10 @@ class HomeAssistantEntityDriver:
                 blocking=True,
             )
         except HomeAssistantError as err:
+            raise CommandUncertainError(str(err)) from err
+        except Exception as err:
+            # Same leak surface as async_start_zone: unexpected errors mean
+            # the stop may not have landed, so reconcile before retrying.
             raise CommandUncertainError(str(err)) from err
         return CommandResult(ok=True)
 

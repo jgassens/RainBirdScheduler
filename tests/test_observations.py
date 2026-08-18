@@ -83,3 +83,20 @@ async def test_stale_reading_is_unknown_and_flagged(
     )
     assert observation.current_temperature_c is None
     assert observation.temperature_stale is True
+
+
+@pytest.mark.parametrize("raw", ["inf", "1e400", "-inf", "not-a-number"])
+async def test_unparsable_rain_delay_is_unknown(
+    hass: HomeAssistant, raw: str
+) -> None:
+    # int(float('inf')) raises OverflowError, which must not escape into
+    # the state-change task.
+    hass.states.async_set("number.rain_delay", raw, {})
+    observation = build_observation(
+        hass,
+        zone_entities={},
+        rain_sensor_entity=None,
+        rain_delay_entity="number.rain_delay",
+        now=dt_util.utcnow(),
+    )
+    assert observation.rain_delay_days is None

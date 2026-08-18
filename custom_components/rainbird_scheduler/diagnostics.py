@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import SchedulerConfigEntry, serde
 from .coordinator import SchedulerCoordinator
 from .driver import NATIVE_QUEUE_ENABLED
+
+# The source unique id is typically the controller's MAC address; the
+# payload is served to any authenticated user over WebSocket, so redact it.
+_TO_REDACT = {"unique_id", "source_unique_id"}
 
 
 def build_diagnostics(coordinator: SchedulerCoordinator) -> dict[str, Any]:
@@ -17,7 +22,7 @@ def build_diagnostics(coordinator: SchedulerCoordinator) -> dict[str, Any]:
     source_entry = coordinator.hass.config_entries.async_get_entry(
         coordinator.source_entry_id
     )
-    return {
+    payload: dict[str, Any] = {
         "source": {
             "config_entry_id": coordinator.source_entry_id,
             "exists": source_entry is not None,
@@ -79,6 +84,7 @@ def build_diagnostics(coordinator: SchedulerCoordinator) -> dict[str, Any]:
             "Bird app actively communicating during scheduled runs.",
         ],
     }
+    return async_redact_data(payload, _TO_REDACT)
 
 
 async def async_get_config_entry_diagnostics(

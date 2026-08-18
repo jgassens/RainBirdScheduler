@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from homeassistant.core import HomeAssistant
 
+from custom_components.rainbird_scheduler import serde
 from custom_components.rainbird_scheduler.const import (
     HISTORY_MAX_RUNS,
     config_store_key,
@@ -113,3 +114,71 @@ async def test_flush_persists_everything_immediately(
     await storage.async_flush(journal, history)
     stored = hass_storage["rainbird_scheduler.entry1.history"]
     assert stored["data"]["interventions"][0]["message"] == "message"
+
+
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "not-a-decimal"])
+async def test_corrupted_decimal_falls_back_to_defaults(
+    hass: HomeAssistant, hass_storage: dict, raw: str
+) -> None:
+    """Unparsable/non-finite Decimals must hit the corruption fallback.
+
+    "not-a-decimal" raises decimal.InvalidOperation (an ArithmeticError) in
+    the Decimal constructor; serde converts it to ValueError so the store's
+    (TypeError, ValueError, KeyError) fallback applies.
+    """
+    config = ConfigData(
+        controller=make_controller(),
+        zones={"z": make_zone("z", 1)},
+        programs={"p": make_program("p", ["z"])},
+    )
+    data = serde.dump(config)
+    data["zones"]["z"]["base_runtime_minutes"] = raw
+    hass_storage[config_store_key("entry1")] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": config_store_key("entry1"),
+        "data": data,
+    }
+    storage = SchedulerStorage(hass, "entry1")
+    assert await storage.async_load_config() is None
+
+
+async def test_unknown_future_major_version_starts_fresh(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    """A stored major version this build cannot migrate is discarded."""
+    hass_storage[config_store_key("entry1")] = {
+        "version": 2,
+        "minor_version": 1,
+        "key": config_store_key("entry1"),
+        "data": {"controller": {"future": "schema"}},
+    }
+    hass_storage[journal_store_key("entry1")] = {
+        "version": 2,
+        "minor_version": 1,
+        "key": journal_store_key("entry1"),
+        "data": {"state": "watering"},
+    }
+    storage = SchedulerStorage(hass, "entry1")
+    assert await storage.async_load_config() is None
+    journal = await storage.async_load_journal()
+    assert journal.state is ExecutorState.IDLE
+
+
+async def test_minor_version_mismatch_keeps_data(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    """Within the same major version no migration is needed."""
+    config = ConfigData(
+        controller=make_controller(),
+        zones={"z": make_zone("z", 1)},
+        programs={"p": make_program("p", ["z"])},
+    )
+    hass_storage[config_store_key("entry1")] = {
+        "version": 1,
+        "minor_version": 2,  # newer minor than this build writes
+        "key": config_store_key("entry1"),
+        "data": serde.dump(config),
+    }
+    storage = SchedulerStorage(hass, "entry1")
+    assert await storage.async_load_config() == config

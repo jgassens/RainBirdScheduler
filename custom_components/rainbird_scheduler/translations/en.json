@@ -22,7 +22,8 @@
     },
     "abort": {
       "no_controllers": "No unclaimed Rain Bird controllers were found. Set up the core Rain Bird integration first, or remove the existing scheduler for this controller.",
-      "already_configured": "This Rain Bird controller already has a scheduler."
+      "already_configured": "This Rain Bird controller already has a scheduler.",
+      "source_unavailable": "The selected Rain Bird controller is no longer available. Set it up again, then retry."
     }
   },
   "selector": {
