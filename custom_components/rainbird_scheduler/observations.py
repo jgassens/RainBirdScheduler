@@ -87,6 +87,7 @@ def build_observation(
     active: set[str] = set()
     any_usable = False
     newest_report: datetime | None = None
+    zone_reported: dict[str, datetime] = {}
 
     for zone_id, entity_id in zone_entities.items():
         state = hass.states.get(entity_id)
@@ -95,6 +96,7 @@ def build_observation(
         any_usable = True
         assert state is not None
         reported = getattr(state, "last_reported", None) or state.last_updated
+        zone_reported[zone_id] = reported
         if newest_report is None or reported > newest_report:
             newest_report = reported
         if state.state == STATE_ON:
@@ -153,4 +155,5 @@ def build_observation(
         temperature_stale=temperature_stale,
         rain_delay_status=rain_delay_status,
         temperature_status=temperature_status,
+        zone_reported_at_utc=zone_reported,
     )

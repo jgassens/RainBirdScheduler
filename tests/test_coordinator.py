@@ -394,3 +394,55 @@ async def test_zone_discovered_after_setup_is_persisted(
         3,
         4,
     }
+
+
+async def test_external_watering_records_intervention(
+    hass: HomeAssistant, scheduler_entry: MockConfigEntry
+) -> None:
+    """A zone turning on with no scheduler run active leaves a timestamped
+    Failures & interventions record naming the zone — the direct evidence
+    trail for a native Rain Bird program fighting the scheduler."""
+    await setup_scheduler(hass, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+    assert coordinator.external_watering is False
+
+    hass.states.async_set(
+        "switch.rain_bird_sprinkler_2",
+        "on",
+        {"zone": 2, "friendly_name": "Sprinkler 2"},
+    )
+    await hass.async_block_till_done()
+
+    assert coordinator.external_watering is True
+    interventions = coordinator.history.history.interventions
+    external = [
+        record
+        for record in interventions
+        if record.kind == "external_watering"
+    ]
+    assert len(external) == 1
+    assert "Sprinkler 2" in external[0].message
+
+    # A second zone joining the same episode does not spam the log.
+    hass.states.async_set(
+        "switch.rain_bird_sprinkler_3",
+        "on",
+        {"zone": 3, "friendly_name": "Sprinkler 3"},
+    )
+    await hass.async_block_till_done()
+    external = [
+        record
+        for record in coordinator.history.history.interventions
+        if record.kind == "external_watering"
+    ]
+    assert len(external) == 1
+
+    # Everything off again: the flag clears.
+    for station in (2, 3):
+        hass.states.async_set(
+            f"switch.rain_bird_sprinkler_{station}",
+            "off",
+            {"zone": station, "friendly_name": f"Sprinkler {station}"},
+        )
+    await hass.async_block_till_done()
+    assert coordinator.external_watering is False

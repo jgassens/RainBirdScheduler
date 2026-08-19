@@ -41,6 +41,7 @@ from .const import (
     EVENT_RUN_COMPLETED,
     EVENT_RUN_FAILED,
     EVENT_RUN_SKIPPED,
+    OBSERVATION_FRESHNESS_WINDOW_SECONDS,
     PLAN_HORIZON_DAYS,
     SOURCE_DOMAIN,
 )
@@ -145,6 +146,11 @@ class SchedulerCoordinator:
         # Occurrences owned by the launch-retry loop (transient block or
         # controller busy); the normal arming path must not double-arm them.
         self._retry_occurrences: dict[str, ProgramOccurrence] = {}
+        # External-watering detection: when the executor was last seen
+        # active (stale switch echoes of our own runs are reported before
+        # this instant) and when we last logged an external episode.
+        self._last_active_seen_utc: datetime | None = None
+        self._last_external_intervention_utc: datetime | None = None
         # What the occurrence timer is currently armed for, so re-arming the
         # same launch instant keeps the live timer instead of churning it.
         self._armed_occurrence_id: str | None = None
@@ -215,6 +221,7 @@ class SchedulerCoordinator:
             emit_event=self._emit_lifecycle,
             history=self.history,
             on_state_change=self._notify_state,
+            get_zone_name=self._zone_display_name,
         )
 
         self._subscribe_states()
@@ -527,9 +534,71 @@ class SchedulerCoordinator:
         self._refresh_flags(observation)
         self._notify_state()
 
+    def _zone_display_name(self, zone_id: str) -> str | None:
+        zone = self.config.zones.get(zone_id)
+        return zone.display_name if zone is not None else None
+
+    def _external_suppression_floor(self) -> datetime | None:
+        """Latest instant our own runs could explain an "on" report.
+
+        Event traffic while a run is active moves the in-memory marker;
+        the journal's finished-occurrence times (persisted, restart-safe)
+        cover runs whose polls were quiet. A grace window on top absorbs
+        the controller stopping a few seconds after our commanded clock
+        and the source re-reporting that lag.
+        """
+        candidates = [self._last_active_seen_utc]
+        finished = self.executor.journal.completed_occurrences.values()
+        candidates.append(max(finished, default=None))
+        floor = max((c for c in candidates if c is not None), default=None)
+        if floor is None:
+            return None
+        return floor + timedelta(
+            seconds=OBSERVATION_FRESHNESS_WINDOW_SECONDS
+        )
+
     def _refresh_flags(self, observation: ControllerObservation) -> None:
-        self.external_watering = bool(observation.active_zone_ids) and (
-            not self.executor.is_active
+        now = observation.observed_at_utc
+        if self.executor.is_active:
+            self._last_active_seen_utc = now
+            self.external_watering = False
+            return
+        # Only zones the source re-confirmed on AFTER our last run (plus
+        # a grace window) count: a just-finished zone's switch stays "on"
+        # until the next source poll, and that stale echo — or the
+        # controller's own few-second stop lag — is not external watering.
+        floor = self._external_suppression_floor()
+        external = {
+            zone_id
+            for zone_id in observation.active_zone_ids
+            if floor is None
+            or observation.zone_reported_at(zone_id) > floor
+        }
+        was_external = self.external_watering
+        self.external_watering = bool(external)
+        if not external or was_external:
+            return
+        last = self._last_external_intervention_utc
+        if last is not None and now - last < timedelta(minutes=10):
+            return
+        self._last_external_intervention_utc = now
+        names = ", ".join(
+            sorted(self._zone_display_name(z) or z for z in external)
+        )
+        hint = (
+            " The controller's own schedule is enabled (its native calendar "
+            "has programmed events) — that is almost certainly what is "
+            "watering. While this scheduler is authoritative, clear the "
+            "controller's internal programs to stop the two from fighting."
+            if self.native_schedule_conflict
+            else " Likely causes: a native Rain Bird program on the "
+            "controller, the Rain Bird app, or another Home Assistant "
+            "automation."
+        )
+        self.history.record_intervention(
+            "external_watering",
+            f"Zone(s) {names} started watering outside any scheduled run."
+            + hint,
         )
 
     async def _on_registry_updated(self, event: Event[Any]) -> None:

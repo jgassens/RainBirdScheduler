@@ -258,6 +258,41 @@ def test_observation_roundtrips_temperature() -> None:
     assert loaded.temperature_stale is True
 
 
+def test_observation_roundtrips_zone_reported_times() -> None:
+    observation = ControllerObservation(
+        observed_at_utc=NOW,
+        active_zone_ids=frozenset({"zone-a"}),
+        rain_sensor_active=False,
+        rain_delay_days=0,
+        source_available=True,
+        freshness=ObservationFreshness.FRESH,
+        zone_reported_at_utc={"zone-a": NOW, "zone-b": NOW},
+    )
+    loaded = serde.load(ControllerObservation, serde.dump(observation))
+    assert loaded.zone_reported_at_utc == {"zone-a": NOW, "zone-b": NOW}
+    assert loaded.zone_reported_at("zone-a") == NOW
+    # Zones missing from the map fall back to the snapshot instant.
+    assert loaded.zone_reported_at("zone-c") == NOW
+
+
+def test_observation_without_reported_map_falls_back() -> None:
+    """Journals persisted before the field existed load and behave."""
+    payload = serde.dump(
+        ControllerObservation(
+            observed_at_utc=NOW,
+            active_zone_ids=frozenset({"zone-a"}),
+            rain_sensor_active=False,
+            rain_delay_days=0,
+            source_available=True,
+            freshness=ObservationFreshness.FRESH,
+        )
+    )
+    del payload["zone_reported_at_utc"]
+    loaded = serde.load(ControllerObservation, payload)
+    assert loaded.zone_reported_at_utc == {}
+    assert loaded.zone_reported_at("zone-a") == NOW
+
+
 @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "abc"])
 def test_bare_decimal_rejects_non_finite_and_garbage(raw: str) -> None:
     # InvalidOperation is an ArithmeticError, not a ValueError: if serde

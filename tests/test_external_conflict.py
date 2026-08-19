@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+from decimal import Decimal
+
 from custom_components.rainbird_scheduler.models import (
     ExecutorState,
     InterruptionPolicy,
@@ -9,7 +12,8 @@ from custom_components.rainbird_scheduler.models import (
     StepStatus,
 )
 
-from .harness import DriverError, three_zone_rig
+from .harness import DriverError, build_rig, three_zone_rig
+from .helpers import make_program, make_zone
 
 
 async def test_external_zone_pauses_run_by_default() -> None:
@@ -289,6 +293,190 @@ async def test_stale_on_for_finished_zone_does_not_conflict() -> None:
     # A genuinely fresh "on" for that zone is still a conflict.
     await rig.zone_event("front-lawn", True, active={"front-lawn", "side-lawn"})
     assert rig.journal().state is ExecutorState.PAUSED_EXTERNAL
+
+
+def _soaked_garden_rig():
+    """One zone, two 5-minute cycles separated by a 60-minute soak —
+    the live 'Garden' program that failed every morning."""
+    zones = [
+        make_zone(
+            "garden",
+            1,
+            base_runtime_minutes=Decimal(10),
+            max_cycle_minutes=5,
+            minimum_soak_minutes=60,
+        )
+    ]
+    program = make_program("garden-program", ["garden"])
+    return build_rig(zones, program)
+
+
+async def test_same_zone_relit_deep_in_soak_is_external_not_overrun() -> None:
+    """The Aug 18/19 07:00 AM signature.
+
+    Cycle 1 waters 06:00-06:05 and completes. During the hour-long soak
+    before cycle 2, the controller's own 7:00 program lights the same
+    zone. That is a fresh external start, not our command overrunning —
+    the run must pause for the conflict instead of stopping the
+    controller and failing.
+    """
+    rig = _soaked_garden_rig()
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(5 * 60)  # cycle 1 completes on its clock
+    journal = rig.journal()
+    assert journal.step_results[0].status is StepStatus.COMPLETED
+    assert journal.state is ExecutorState.INTER_ZONE_GAP
+
+    # 55 minutes into the soak, the zone reports on again (native program).
+    await rig.tm.advance(55 * 60)
+    await rig.zone_event("garden", True)
+
+    journal = rig.journal()
+    assert journal.state is ExecutorState.PAUSED_EXTERNAL
+    # Cycle 1's completed record is untouched; nothing was stopped.
+    assert journal.step_results[0].status is StepStatus.COMPLETED
+    assert rig.driver.stop_calls == 0
+    assert not rig.history.finished
+    assert not any(
+        kind == "controller_overrun" for kind, _ in rig.history.interventions
+    )
+    assert any(
+        kind == "external_activity" for kind, _ in rig.history.interventions
+    )
+
+    # The native program finishes 10 minutes later; the run resumes and
+    # cycle 2 still waters (pause was well within tolerance).
+    await rig.tm.advance(10 * 60)
+    await rig.zone_event("garden", False, active=set())
+    journal = rig.journal()
+    assert journal.state is ExecutorState.WATERING
+    assert journal.current_step_index == 1
+    assert len(rig.driver.start_calls) == 2
+
+    await rig.tm.advance(2 * 3600)
+    assert rig.journal().state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.COMPLETED
+
+
+async def test_same_zone_on_just_after_step_end_is_still_overrun_path() -> None:
+    """Close to the commanded end, the overrun reconcile still owns it."""
+    rig = _soaked_garden_rig()
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(5 * 60)
+    assert rig.journal().state is ExecutorState.INTER_ZONE_GAP
+
+    # 30 seconds after the end: plausibly our own command still running.
+    await rig.tm.advance(30)
+    await rig.zone_event("garden", True)
+    assert rig.journal().state is ExecutorState.RECONCILING
+
+    # Confirmed on at both fresh reads: genuine overrun, controller stopped.
+    await rig.tm.advance(31)
+    await rig.zone_event("garden", True)
+    await rig.tm.advance(31)
+    assert rig.driver.stop_calls == 1
+    assert rig.history.finished[0][1] is RunOutcome.FAILED
+
+
+async def test_overrun_confirm_ignores_stale_cached_on() -> None:
+    """A confirm read carrying a pre-end cached "on" must not fail the run.
+
+    The Aug 18/19 6 AM signature: the refresh requested by the reconcile
+    never lands (slow LNK poll), so both confirmation reads serve the same
+    cached switch state from before the commanded end. That is an echo of
+    our own watering, not proof the valve is still open — the controller
+    stops the zone on its own timer.
+    """
+    rig = three_zone_rig()
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(12 * 60)
+    expected_end = rig.tm.now
+    await rig.tm.advance(1)
+
+    # A fresh post-end "on" raises the suspicion (this part is genuine).
+    await rig.zone_event("front-lawn", True)
+    assert rig.journal().state is ExecutorState.RECONCILING
+
+    # But the confirm's live read returns state last confirmed BEFORE the
+    # commanded end: the poll never refreshed.
+    stale_report = expected_end - timedelta(seconds=20)
+    rig.driver.observation = rig.driver.make_observation(
+        {"front-lawn"},
+        zone_reported_at={"front-lawn": stale_report},
+    )
+    await rig.tm.advance(31)
+
+    journal = rig.journal()
+    assert rig.driver.stop_calls == 0
+    assert journal.step_results[0].status is StepStatus.COMPLETED
+    assert not any(
+        kind == "controller_overrun" for kind, _ in rig.history.interventions
+    )
+    # The run moved on instead of failing.
+    assert journal.state in (
+        ExecutorState.WATERING,
+        ExecutorState.INTER_ZONE_GAP,
+    )
+
+
+async def test_snapshot_built_now_with_stale_zone_state_no_phantom_pause() -> None:
+    """The 8 PM 'completed_with_skips' signature, first half.
+
+    An unrelated event (temperature, rain sensor) during the inter-zone
+    gap builds a fresh snapshot that still carries the just-finished
+    zone's stale "on" (the source has not re-polled). The snapshot's
+    build time must not lend that state freshness: the next step starts.
+    """
+    rig = three_zone_rig()
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(12 * 60)  # zone 1 completes; gap armed
+    journal = rig.journal()
+    assert journal.state is ExecutorState.INTER_ZONE_GAP
+    end_of_zone_1 = journal.step_results[0].actual_end_utc
+    assert end_of_zone_1 is not None
+
+    # Temperature event 2s into the gap: snapshot built "now", zone 1
+    # still cached on from before its end.
+    await rig.tm.advance(2)
+    stale = rig.driver.make_observation(
+        {"front-lawn"},
+        zone_reported_at={
+            "front-lawn": end_of_zone_1 - timedelta(seconds=30)
+        },
+    )
+    rig.driver.observation = stale
+    await rig.executor.async_handle_weather_state(stale)
+
+    # Gap elapses: zone 2 starts instead of pausing for phantom activity.
+    await rig.tm.advance(5)
+    journal = rig.journal()
+    assert journal.state is ExecutorState.WATERING
+    assert journal.current_step_index == 1
+    assert rig.driver.start_calls[-1][0].station_number == 2
+    assert not any(
+        kind == "external_activity" for kind, _ in rig.history.interventions
+    )
+
+
+async def test_fresh_external_zone_at_step_start_pauses_and_logs() -> None:
+    """Genuinely fresh external activity at a step boundary still pauses —
+    and now leaves a Failures & interventions record naming the zones."""
+    rig = three_zone_rig()
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(12 * 60)
+    await rig.tm.advance(2)
+
+    # The controller's own program lights up another zone, freshly.
+    fresh = rig.driver.make_observation({"back-lawn"})
+    rig.driver.observation = fresh
+    await rig.executor.async_handle_weather_state(fresh)
+
+    await rig.tm.advance(5)
+    assert rig.journal().state is ExecutorState.PAUSED_EXTERNAL
+    assert any(
+        kind == "external_activity" and "Back Lawn" in message
+        for kind, message in rig.history.interventions
+    )
 
 
 async def test_overrun_confirm_survives_observe_failure() -> None:

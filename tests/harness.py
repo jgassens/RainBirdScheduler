@@ -108,9 +108,16 @@ class FakeDriver:
         observed_at: datetime | None = None,
         temperature_c: Decimal | None = None,
         temperature_stale: bool = False,
+        zone_reported_at: dict[str, datetime] | None = None,
     ) -> ControllerObservation:
+        when = observed_at or self.tm.now
+        # Default: every active zone was freshly re-confirmed at the
+        # observation instant. Pass zone_reported_at to model stale
+        # switch states (the source last confirmed the zone earlier).
+        reported = dict.fromkeys(active or set(), when)
+        reported.update(zone_reported_at or {})
         return ControllerObservation(
-            observed_at_utc=observed_at or self.tm.now,
+            observed_at_utc=when,
             active_zone_ids=frozenset(active or set()),
             rain_sensor_active=rain_sensor,
             rain_delay_days=rain_delay,
@@ -118,6 +125,7 @@ class FakeDriver:
             freshness=ObservationFreshness.FRESH,
             current_temperature_c=temperature_c,
             temperature_stale=temperature_stale,
+            zone_reported_at_utc=reported,
         )
 
     def set_observation(self, active: set[str] | None = None, **kwargs) -> None:

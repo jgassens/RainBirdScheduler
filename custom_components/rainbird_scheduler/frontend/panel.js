@@ -230,7 +230,10 @@ const HELP = {
     (30 min by default), <i>Skip</i> records a skip.</p>
     <p><b class="k">External interruption</b> — someone stops the controller
     or starts an app run mid-plan: <i>Pause and resume</i> waits out the
-    conflict and continues; <i>Abort</i> ends the run with that outcome.</p>
+    conflict and continues; <i>Abort</i> ends the run with that outcome.
+    A run that has already begun watering resumes as long as the pause
+    itself stayed within the missed-run tolerance; only a run that never
+    started is held to "requested start + tolerance".</p>
     <p><b class="k">Watering window</b> — hard bounds on when steps may START.
     If a compiled step would fall outside: <i>Skip that step</i>,
     <i>Truncate the last step</i> to fit, <i>Defer the whole occurrence</i>,
@@ -345,6 +348,16 @@ const HELP = {
     <p><b class="k">Failures &amp; interventions</b> — the bounded log of
     everything that needed (or may need) a human: repeated command failures,
     conflicts left in "require intervention" state, and similar.</p>
+    <p><b class="k">Reading collision failures</b> — three kinds point at a
+    second schedule fighting this one. <i>external_watering</i>: zones turned
+    on while no scheduler run was active (with timestamps — compare them to
+    the controller's native program start times). <i>controller_overrun</i>:
+    a zone this scheduler started stayed on past its commanded end, freshly
+    re-confirmed twice, so the controller was stopped and the run failed.
+    <i>external_stop</i>: a zone this scheduler started turned off early and
+    the stop was confirmed by a fresh read. All three usually mean the
+    controller's own internal programs (or the Rain Bird app, or another
+    automation) are still running — check the banner on Overview.</p>
     <p>This table is the authoritative record (a bounded store independent of
     HA's recorder). The lifecycle <i>event entity</i> mirrors it for
     automations and Logbook, but this page is the source of truth.</p>`,
@@ -1158,6 +1171,37 @@ class RainBirdSchedulerPanel extends HTMLElement {
 
     return `
       ${helpBlock("overview", "live state and the compiled plan")}
+      ${
+        state.native_schedule_conflict
+          ? `<div class="banner warn">
+              <b>The controller's own schedule is still active</b>
+              <div>The Rain Bird controller has internal programs of its own
+                (its native calendar shows scheduled events) while this
+                scheduler owns automatic watering. Two schedules driving the
+                same valves causes exactly the failures this page reports:
+                zones staying on past their commanded end
+                (<i>controller_overrun</i>), zones stopping early
+                (<i>external_stop</i>), and runs pausing or skipping for
+                "external activity".</div>
+              <div class="sub">Fix: clear or disable the programs on the
+                controller itself (or in the Rain Bird app), or switch the
+                authority mode in Settings if you want the controller to stay
+                in charge. Watch History → Failures &amp; interventions for
+                "external watering" entries to confirm when the native
+                schedule runs.</div>
+            </div>`
+          : ""
+      }
+      ${
+        state.external_watering
+          ? `<div class="banner warn">
+              <b>External watering is active right now</b>
+              <div>A zone is on that this scheduler did not start — a native
+                Rain Bird program, the app, or another automation is driving
+                the controller.</div>
+            </div>`
+          : ""
+      }
       ${
         cancelled
           ? `<div class="banner warn">

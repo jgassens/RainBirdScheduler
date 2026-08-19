@@ -166,7 +166,7 @@ async def test_resume_past_tolerance_expires_run() -> None:
     await rig.executor.async_start_run(rig.plan)
     await rig.tm.advance(60)
     await rig.executor.async_pause()
-    await rig.tm.advance(45 * 60)  # beyond the 30-minute tolerance
+    await rig.tm.advance(45 * 60)  # pause itself outlasts the tolerance
     await rig.executor.async_resume()
 
     journal = rig.journal()
@@ -175,6 +175,73 @@ async def test_resume_past_tolerance_expires_run() -> None:
     assert outcome is RunOutcome.SKIPPED
     results = rig.final_step_results()
     assert SkipReason.MISSED_TOLERANCE.value in results["1"]["reason"]
+
+
+async def test_short_midrun_pause_resumes_even_past_start_tolerance() -> None:
+    """The Aug 18 8 PM signature: a brief mid-run pause must not kill
+    the rest of a long program just because the wall clock passed
+    requested start + tolerance while the run was legitimately working.
+    """
+    rig = three_zone_rig()
+    await rig.executor.async_start_run(rig.plan)
+    # Zone 1 completes on its clock at 14:12; during the gap another
+    # zone lights up and pauses the run.
+    await rig.tm.advance(12 * 60 + 2)
+    await rig.zone_event("back-lawn", True, active={"back-lawn"})
+    assert rig.journal().state is ExecutorState.PAUSED_EXTERNAL
+
+    # The external zone clears 19 minutes later — 14:31, past the
+    # 14:30 start-tolerance cutoff, but the pause itself was short.
+    await rig.tm.advance(19 * 60)
+    await rig.zone_event("back-lawn", False, active=set())
+
+    journal = rig.journal()
+    assert journal.state is ExecutorState.WATERING
+    assert journal.current_step_index == 1
+    assert rig.driver.start_calls[-1][0].station_number == 2
+
+    # The rest of the program still completes.
+    await rig.tm.advance(2 * 3600)
+    assert rig.journal().state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.COMPLETED
+
+
+async def test_long_midrun_pause_still_expires() -> None:
+    rig = three_zone_rig()
+    await rig.executor.async_start_run(rig.plan)
+    await rig.tm.advance(12 * 60 + 2)
+    await rig.zone_event("back-lawn", True, active={"back-lawn"})
+    assert rig.journal().state is ExecutorState.PAUSED_EXTERNAL
+
+    # The controller stays busy for 40 minutes: longer than the
+    # tolerance, so the remaining zones are skipped.
+    await rig.tm.advance(40 * 60)
+    await rig.zone_event("back-lawn", False, active=set())
+
+    journal = rig.journal()
+    assert journal.state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.COMPLETED_WITH_SKIPS
+    assert rig.history.finished[0][2] == SkipReason.MISSED_TOLERANCE.value
+
+
+async def test_pre_start_pause_keeps_start_tolerance_anchor() -> None:
+    """A run that never began must still expire against requested start."""
+    rig = three_zone_rig()
+    rig.journal().last_observation = rig.driver.make_observation(
+        {"back-lawn"}
+    )
+    await rig.executor.async_start_run(rig.plan)
+    # Nothing was commanded; the run paused before its first zone.
+    assert rig.journal().state is ExecutorState.PAUSED_EXTERNAL
+    assert rig.driver.start_calls == []
+
+    # The controller frees up only 35 minutes later: too late to start.
+    await rig.tm.advance(35 * 60)
+    await rig.zone_event("back-lawn", False, active=set())
+
+    assert rig.journal().state is ExecutorState.IDLE
+    assert rig.history.finished[0][1] is RunOutcome.SKIPPED
+    assert rig.history.finished[0][2] == SkipReason.MISSED_TOLERANCE.value
 
 
 async def test_pre_start_rain_delay_skips_run() -> None:

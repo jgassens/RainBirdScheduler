@@ -37,6 +37,7 @@ from .const import (
     EVENT_ZONE_COMPLETED,
     EVENT_ZONE_STARTED,
     MAX_COMMAND_ATTEMPTS,
+    OBSERVATION_FRESHNESS_WINDOW_SECONDS,
 )
 from .driver.base import (
     DriverError,
@@ -167,6 +168,7 @@ class RunExecutor:
         emit_event: EventEmitter,
         history: HistorySink,
         on_state_change: Callable[[], None] = lambda: None,
+        get_zone_name: Callable[[str], str | None] | None = None,
     ) -> None:
         self._driver = driver
         self.journal = journal
@@ -176,6 +178,7 @@ class RunExecutor:
         self._get_config = get_controller_config
         self._get_program = get_program
         self._get_zone_reference = get_zone_reference
+        self._get_zone_name = get_zone_name
         self._emit = emit_event
         self._history = history
         self._notify = on_state_change
@@ -231,6 +234,7 @@ class RunExecutor:
             journal.uncertain_count = 0
             journal.stop_requested = False
             journal.paused_reason = None
+            journal.paused_at_utc = None
             await self._write()
             self._emit(
                 EVENT_RUN_STARTED,
@@ -306,6 +310,7 @@ class RunExecutor:
                 await self._send_stop()
             self.journal.state = ExecutorState.PAUSED_EXTERNAL
             self.journal.paused_reason = reason
+            self.journal.paused_at_utc = self._now()
             await self._write()
         self._notify()
 
@@ -464,6 +469,7 @@ class RunExecutor:
         if behavior is SensorCutBehavior.PAUSE_UNTIL_DRY:
             journal.state = ExecutorState.PAUSED_SENSOR
             journal.paused_reason = _PAUSE_REASON_FREEZE
+            journal.paused_at_utc = self._now()
             await self._write()
             return
         detail = (
@@ -562,13 +568,37 @@ class RunExecutor:
         )
         return plan.requested_start_utc + tolerance
 
+    def _zone_name(self, zone_id: str) -> str:
+        """Best display name for a zone (config, then plan, then raw id)."""
+        if self._get_zone_name is not None:
+            name = self._get_zone_name(zone_id)
+            if name:
+                return name
+        plan = self.journal.run_plan
+        if plan is not None:
+            for step in plan.steps:
+                if step.zone_id == zone_id:
+                    return step.zone_name
+        return zone_id
+
+    def _zone_names(self, zone_ids: frozenset[str] | set[str]) -> str:
+        return ", ".join(sorted(self._zone_name(z) for z in zone_ids))
+
     def _fresh_evidence_zone_on(self, zone_id: str, since: datetime) -> bool:
+        """Has the source re-confirmed this zone on at/after ``since``?
+
+        Judged against the zone's own last_reported time, never the
+        snapshot build time: an observation assembled "now" (by an
+        unrelated sensor or temperature event) can still carry a switch
+        state the source last confirmed before ``since`` — a stale echo
+        of our own watering, not contradictory evidence.
+        """
         observation = self.journal.last_observation
         if observation is None:
             return False
         return (
             zone_id in observation.active_zone_ids
-            and observation.observed_at_utc >= since
+            and observation.zone_reported_at(zone_id) >= since
         )
 
     async def _send_stop(self) -> None:
@@ -782,7 +812,17 @@ class RunExecutor:
             external = self._external_zones(observation, index)
             if external:
                 journal.state = ExecutorState.PAUSED_EXTERNAL
+                journal.paused_at_utc = self._now()
                 await self._write()
+                self._history.record_intervention(
+                    "external_activity",
+                    f"Zone(s) {self._zone_names(external)} reported on "
+                    "outside this run; the run is paused until the "
+                    "controller is free. Another schedule is driving the "
+                    "controller (native Rain Bird program, app, or "
+                    "automation).",
+                    run_id=plan.run_id,
+                )
                 self._emit(
                     EVENT_RUN_INTERRUPTED,
                     {
@@ -832,10 +872,14 @@ class RunExecutor:
             if result is None or result.actual_end_utc is None:
                 continue
             # A stale "on" for a zone we just finished is not evidence of
-            # external activity unless observed after that zone ended.
+            # external activity unless the source re-confirmed it after
+            # that zone ended. Judged per zone: the snapshot itself may be
+            # freshly built (its observed_at is "now") while still
+            # carrying a switch state from the poll before the zone ended.
             if (
                 step.zone_id in active
-                and observation.observed_at_utc <= result.actual_end_utc
+                and observation.zone_reported_at(step.zone_id)
+                <= result.actual_end_utc
             ):
                 active.discard(step.zone_id)
         return frozenset(active)
@@ -972,11 +1016,17 @@ class RunExecutor:
             journal.last_observation = observation
         except DriverError:
             observation = journal.last_observation
+        # "Still on" needs the source to have re-confirmed the zone after
+        # the commanded end. An "on" last reported before the end is a
+        # stale echo of our own watering (the source polls a slow
+        # controller); the controller stops the zone on its own commanded
+        # timer, so completing on the clock is the safe reading.
         still_on = (
             zone_id is not None
             and expected_end is not None
             and observation is not None
             and zone_id in observation.active_zone_ids
+            and observation.zone_reported_at(zone_id) >= expected_end
         )
         if not still_on:
             await self._complete_step(index, actual_end=expected_end)
@@ -1003,10 +1053,17 @@ class RunExecutor:
         await self._send_stop()
         self._end_step(index, StepStatus.OVERRUN_STOPPED, "controller_overrun")
         self._skip_remaining(SkipReason.EXTERNAL_ACTIVITY, "controller_overrun")
+        past_end = ""
+        if expected_end is not None:
+            seconds = int((self._now() - expected_end).total_seconds())
+            past_end = f" {seconds // 60}m{seconds % 60:02d}s"
         self._history.record_intervention(
             "controller_overrun",
-            f"Zone {step.zone_name!r} remained active past its commanded "
-            "end; the controller was stopped.",
+            f"Zone {step.zone_name!r} was still reported on{past_end} past "
+            "its commanded end (re-confirmed by two fresh reads); the "
+            "controller was stopped. Something else is keeping the zone "
+            "running — most likely a native Rain Bird program on the "
+            "controller itself, the Rain Bird app, or another automation.",
             run_id=plan.run_id,
         )
         self._emit(
@@ -1310,11 +1367,24 @@ class RunExecutor:
             zone_id == step.zone_id
             and result is not None
             and result.actual_end_utc is not None
-            and observation.observed_at_utc > result.actual_end_utc
+            and observation.zone_reported_at(zone_id) > result.actual_end_utc
         ):
-            # Our just-finished zone reports on after its end: overrun path.
-            journal.current_step_expected_end = result.actual_end_utc
-            await self._enter_overrun_reconcile()
+            # Our just-finished zone reports on after its end. Only a
+            # report CLOSE to that end can mean our own command overran
+            # (the controller stopping late, plus one poll of latency). A
+            # soak gap can hold this state for an hour; the same zone
+            # lighting up long after its end is a fresh external start —
+            # a native Rain Bird program or app run — not our overrun,
+            # and must not stop the controller and fail the run.
+            reported = observation.zone_reported_at(zone_id)
+            proximity = timedelta(
+                seconds=OBSERVATION_FRESHNESS_WINDOW_SECONDS
+            )
+            if reported - result.actual_end_utc <= proximity:
+                journal.current_step_expected_end = result.actual_end_utc
+                await self._enter_overrun_reconcile()
+            else:
+                await self._external_conflict(frozenset({zone_id}))
             return
         if zone_id != step.zone_id:
             await self._external_conflict(frozenset({zone_id}))
@@ -1349,6 +1419,7 @@ class RunExecutor:
             )
             if behavior is SensorCutBehavior.PAUSE_UNTIL_DRY:
                 journal.state = ExecutorState.PAUSED_SENSOR
+                journal.paused_at_utc = self._now()
                 await self._write()
                 return
             detail = (
@@ -1375,6 +1446,25 @@ class RunExecutor:
             return
 
         self._end_step(index, StepStatus.EXTERNAL_STOP, "external_stop")
+        cut_short = ""
+        if journal.current_step_expected_end is not None:
+            seconds = int(
+                (
+                    journal.current_step_expected_end
+                    - observation.observed_at_utc
+                ).total_seconds()
+            )
+            if seconds > 0:
+                cut_short = f" {seconds // 60}m{seconds % 60:02d}s early"
+        self._history.record_intervention(
+            "external_stop",
+            f"Zone {step.zone_name!r} turned off{cut_short}, outside the "
+            "scheduler, and the stop was confirmed by a fresh read. "
+            "Something else stopped or took over the controller — most "
+            "likely a native Rain Bird program advancing its own cycle, "
+            "the Rain Bird app, or another automation.",
+            run_id=plan.run_id,
+        )
         self._emit(
             EVENT_RUN_INTERRUPTED,
             {
@@ -1411,7 +1501,16 @@ class RunExecutor:
                 "zones": sorted(zones),
             },
         )
-        if policy is InterruptionPolicy.ABORT:
+        aborting = policy is InterruptionPolicy.ABORT
+        self._history.record_intervention(
+            "external_activity",
+            f"Zone(s) {self._zone_names(zones)} turned on outside this run; "
+            f"the run was {'aborted' if aborting else 'paused'}. Another "
+            "schedule is driving the controller (native Rain Bird program, "
+            "app, or automation).",
+            run_id=plan.run_id,
+        )
+        if aborting:
             self._skip_remaining(
                 SkipReason.EXTERNAL_ACTIVITY, "external zone active"
             )
@@ -1421,20 +1520,50 @@ class RunExecutor:
             )
             return
         journal.state = ExecutorState.PAUSED_EXTERNAL
+        journal.paused_at_utc = self._now()
         await self._write()
 
+    def _run_has_begun(self) -> bool:
+        """Has any watering actually happened (or started) this run?"""
+        return any(
+            result.status is not StepStatus.PENDING
+            or result.actual_start_utc is not None
+            for result in self.journal.step_results.values()
+        )
+
     async def _resume_or_expire(self) -> None:
-        """Continue a paused run, or expire it past the tolerance."""
+        """Continue a paused run, or expire it.
+
+        Two different questions hide here. Before any watering has
+        happened, the missed-run tolerance bounds how late the run may
+        START (anchored to the requested start). Once the run is
+        underway, that anchor is meaningless — a long program is
+        legitimately still working well past requested start +
+        tolerance — so a mid-run pause instead expires only when the
+        pause itself outlasted the tolerance.
+        """
         journal = self.journal
+        now = self._now()
+        paused_at = journal.paused_at_utc
         journal.paused_reason = None
-        if self._now() <= self._latest_permissible_start():
+        journal.paused_at_utc = None
+        tolerance = timedelta(
+            minutes=self._config().missed_run_tolerance_minutes
+        )
+        if self._run_has_begun():
+            # Journals persisted before paused_at_utc existed resume
+            # permissively (stale bookkeeping never blocks progression).
+            expired = paused_at is not None and now - paused_at > tolerance
+            detail = "paused longer than the missed-run tolerance"
+        else:
+            expired = now > self._latest_permissible_start()
+            detail = "paused past missed-run tolerance"
+        if not expired:
             journal.state = ExecutorState.WAITING
             await self._write()
             await self._advance()
             return
-        self._skip_remaining(
-            SkipReason.MISSED_TOLERANCE, "paused past missed-run tolerance"
-        )
+        self._skip_remaining(SkipReason.MISSED_TOLERANCE, detail)
         await self._finish_run(
             RunOutcome.COMPLETED_WITH_SKIPS
             if self._any_completed()
@@ -1504,6 +1633,8 @@ class RunExecutor:
 
         if external:
             journal.state = ExecutorState.PAUSED_EXTERNAL
+            if journal.paused_at_utc is None:
+                journal.paused_at_utc = now
             await self._write()
             return
 
@@ -1660,4 +1791,5 @@ class RunExecutor:
         journal.current_step_expected_end = None
         journal.stop_requested = False
         journal.paused_reason = None
+        journal.paused_at_utc = None
         await self._write()

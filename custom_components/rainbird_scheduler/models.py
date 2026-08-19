@@ -682,6 +682,19 @@ class ControllerObservation:
     # label when the value is None but the status claims OK.
     rain_delay_status: RainDelayStatus = RainDelayStatus.OK
     temperature_status: TemperatureStatus = TemperatureStatus.OK
+    # When each zone's source entity last *reported* its state (HA's
+    # last_reported: refreshed by every source poll, even when the value
+    # is unchanged). ``observed_at_utc`` is when this snapshot was built —
+    # a snapshot built "now" can still carry a switch state the source
+    # last confirmed a minute ago, so evidence freshness must be judged
+    # per zone, never by the snapshot timestamp. Empty for observations
+    # persisted before this field existed (callers fall back to
+    # ``observed_at_utc``).
+    zone_reported_at_utc: dict[str, datetime] = field(default_factory=dict)
+
+    def zone_reported_at(self, zone_id: str) -> datetime:
+        """When ``zone_id``'s state was last confirmed by the source."""
+        return self.zone_reported_at_utc.get(zone_id, self.observed_at_utc)
 
 
 def freeze_active(
@@ -764,6 +777,12 @@ class ExecutionJournal:
     uncertain_count: int = 0
     stop_requested: bool = False
     paused_reason: str | None = None
+    # When the run last entered a paused state; None while not paused.
+    # Mid-run resume decisions measure the pause length against the
+    # missed-run tolerance (a run that is already watering must not be
+    # expired just because the wall clock passed requested start +
+    # tolerance while it was legitimately working).
+    paused_at_utc: datetime | None = None
     completed_occurrences: dict[str, datetime] = field(default_factory=dict)
     updated_at_utc: datetime | None = None
 
