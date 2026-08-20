@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
+
+from astral import Observer
+from astral.sun import sunrise as astral_sunrise
 
 from custom_components.rainbird_scheduler.models import (
     RecurrenceKind,
     RecurrenceRule,
+    StartKind,
+    StartTime,
 )
 from custom_components.rainbird_scheduler.recurrence import (
     date_qualifies,
@@ -16,6 +21,9 @@ from custom_components.rainbird_scheduler.recurrence import (
 from .helpers import TZ, make_program
 
 CREATED = datetime(2026, 6, 1, tzinfo=UTC)
+
+# Roughly Chicago: matches the test timezone, far from polar edge cases.
+LOCATION = (41.8781, -87.6298)
 
 
 def window(start: datetime, days: int = 7) -> tuple[datetime, datetime]:
@@ -136,3 +144,109 @@ def test_window_bounds_are_half_open() -> None:
         program, TZ, exact.replace(hour=13), exact, CREATED
     )
     assert occurrences == []
+
+
+def test_sunrise_start_with_negative_offset() -> None:
+    program = make_program("dawn", ["zone-a"])
+    program.nominal_start_times = [
+        StartTime(kind=StartKind.SUNRISE, offset_minutes=-30)
+    ]
+    start, end = window(datetime(2026, 6, 1, 0, 0, tzinfo=UTC), days=1)
+    occurrences, warnings = occurrences_between(
+        program, TZ, start, end, CREATED, location=LOCATION
+    )
+    assert not warnings
+    assert len(occurrences) == 1
+    expected = astral_sunrise(
+        Observer(latitude=LOCATION[0], longitude=LOCATION[1]),
+        date=date(2026, 6, 1),
+        tzinfo=TZ,
+    ) - timedelta(minutes=30)
+    expected = expected.astimezone(UTC).replace(second=0, microsecond=0)
+    assert occurrences[0].scheduled_start_utc == expected
+    # Chicago sunrise in June is ~05:15 local; -30 min lands before 5 AM.
+    local = occurrences[0].scheduled_start_local
+    assert 4 <= local.hour <= 5
+    assert local.second == 0
+
+
+def test_solar_start_follows_the_season() -> None:
+    program = make_program("dawn", ["zone-a"])
+    program.nominal_start_times = [StartTime(kind=StartKind.SUNSET)]
+
+    june, june_end = window(datetime(2026, 6, 1, 0, 0, tzinfo=UTC), days=1)
+    december, dec_end = window(datetime(2026, 12, 1, 0, 0, tzinfo=UTC), days=1)
+    summer, _ = occurrences_between(
+        program, TZ, june, june_end, CREATED, location=LOCATION
+    )
+    winter, _ = occurrences_between(
+        program, TZ, december, dec_end, CREATED, location=LOCATION
+    )
+    assert len(summer) == 1 and len(winter) == 1
+    # Chicago sunset: ~8:20 PM in June, ~4:20 PM in December.
+    assert summer[0].scheduled_start_local.hour >= 19
+    assert winter[0].scheduled_start_local.hour <= 17
+
+
+def test_mixed_clock_and_solar_starts_sort_by_instant() -> None:
+    program = make_program("mixed", ["zone-a"])
+    program.nominal_start_times = [
+        StartTime(kind=StartKind.SUNSET, offset_minutes=15),
+        StartTime(kind=StartKind.CLOCK, at=time(6, 0)),
+    ]
+    # Window aligned to local midnight so exactly one local day is inside.
+    start, end = window(datetime(2026, 6, 1, 5, 0, tzinfo=UTC), days=1)
+    occurrences, warnings = occurrences_between(
+        program, TZ, start, end, CREATED, location=LOCATION
+    )
+    assert not warnings
+    assert len(occurrences) == 2
+    assert occurrences[0].scheduled_start_local.time() == time(6, 0)
+    assert occurrences[1].scheduled_start_local.hour >= 19
+
+
+def test_solar_start_without_location_warns_and_skips() -> None:
+    program = make_program("dawn", ["zone-a"])
+    program.nominal_start_times = [
+        StartTime(kind=StartKind.SUNRISE, offset_minutes=-45),
+        StartTime(kind=StartKind.CLOCK, at=time(7, 0)),
+    ]
+    start, end = window(datetime(2026, 6, 1, 0, 0, tzinfo=UTC), days=2)
+    occurrences, warnings = occurrences_between(
+        program, TZ, start, end, CREATED, location=None
+    )
+    # Clock starts still happen; the solar ones are skipped with ONE
+    # warning, not one per day.
+    assert len(occurrences) == 2
+    assert all(
+        occ.scheduled_start_local.time() == time(7, 0) for occ in occurrences
+    )
+    assert len(warnings) == 1
+    assert "no home location" in warnings[0].message
+
+
+def test_polar_day_solar_start_warns_and_skips() -> None:
+    program = make_program("midnight-sun", ["zone-a"])
+    program.nominal_start_times = [StartTime(kind=StartKind.SUNSET)]
+    start, end = window(datetime(2026, 6, 20, 0, 0, tzinfo=UTC), days=1)
+    # Longyearbyen: the sun does not set in June.
+    occurrences, warnings = occurrences_between(
+        program, TZ, start, end, CREATED, location=(78.22, 15.63)
+    )
+    assert occurrences == []
+    assert warnings
+    assert "does not rise/set" in warnings[0].message
+
+
+def test_legacy_time_and_string_starts_still_work() -> None:
+    program = make_program("legacy", ["zone-a"])
+    # Direct construction with plain time objects and ISO strings — the
+    # shapes stored configs and older callers use.
+    program.nominal_start_times = [time(9, 0), "18:30:00"]
+    start, end = window(datetime(2026, 6, 1, 0, 0, tzinfo=UTC), days=1)
+    occurrences, warnings = occurrences_between(program, TZ, start, end, CREATED)
+    assert not warnings
+    assert [occ.scheduled_start_local.time() for occ in occurrences] == [
+        time(9, 0),
+        time(18, 30),
+    ]

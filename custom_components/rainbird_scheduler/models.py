@@ -434,6 +434,72 @@ class ProgramZoneStep:
             self.max_cycle_minutes_override = None
 
 
+class StartKind(StrEnum):
+    """How one program start time is anchored."""
+
+    CLOCK = "clock"
+    SUNRISE = "sunrise"
+    SUNSET = "sunset"
+
+
+# Solar offsets beyond ±10 hours are almost certainly input mistakes and
+# would land a "sunrise" start in the previous afternoon.
+MAX_SOLAR_OFFSET_MINUTES = 600
+
+
+@dataclass
+class StartTime:
+    """One program start: a wall-clock time, or sunrise/sunset ± minutes."""
+
+    kind: StartKind = StartKind.CLOCK
+    at: time | None = None  # CLOCK only
+    offset_minutes: int = 0  # solar kinds; negative means before the event
+
+    def __post_init__(self) -> None:
+        if self.kind is StartKind.CLOCK:
+            if self.at is None:
+                raise ValueError("A clock start time requires 'at'")
+            self.offset_minutes = 0
+        else:
+            self.at = None
+            if abs(self.offset_minutes) > MAX_SOLAR_OFFSET_MINUTES:
+                raise ValueError(
+                    "Solar offset must be within "
+                    f"±{MAX_SOLAR_OFFSET_MINUTES} minutes"
+                )
+
+    @staticmethod
+    def normalize(value: StartTime | time | str) -> StartTime:
+        """Coerce legacy representations (plain time / ISO string)."""
+        if isinstance(value, StartTime):
+            return value
+        if isinstance(value, time):
+            return StartTime(kind=StartKind.CLOCK, at=value)
+        if isinstance(value, str):
+            return StartTime(kind=StartKind.CLOCK, at=time.fromisoformat(value))
+        raise ValueError(f"Cannot interpret start time {value!r}")
+
+    def sort_key(self) -> tuple[int, int, str]:
+        """Stable, deterministic ordering across mixed kinds."""
+        order = {StartKind.CLOCK: 0, StartKind.SUNRISE: 1, StartKind.SUNSET: 2}
+        return (
+            order[self.kind],
+            self.offset_minutes,
+            self.at.isoformat() if self.at is not None else "",
+        )
+
+    def label(self) -> str:
+        """Human-readable form for warnings and summaries."""
+        if self.kind is StartKind.CLOCK:
+            assert self.at is not None
+            return self.at.isoformat(timespec="minutes")
+        base = "sunrise" if self.kind is StartKind.SUNRISE else "sunset"
+        if not self.offset_minutes:
+            return base
+        sign = "+" if self.offset_minutes > 0 else "-"
+        return f"{base} {sign}{abs(self.offset_minutes)} min"
+
+
 @dataclass
 class Program:
     """A user-authored irrigation program."""
@@ -444,7 +510,10 @@ class Program:
     enabled: bool = True
     priority: int = 100
     recurrence: RecurrenceRule = field(default_factory=RecurrenceRule)
-    nominal_start_times: list[time] = field(default_factory=list)
+    # Entries are StartTime; plain ``time`` values and ISO strings from
+    # older stores and direct construction are accepted everywhere via
+    # StartTime.normalize.
+    nominal_start_times: list[StartTime] = field(default_factory=list)
     zone_steps: list[ProgramZoneStep] = field(default_factory=list)
     adjustment_provider: AdjustmentProviderConfig = field(
         default_factory=AdjustmentProviderConfig
@@ -454,6 +523,13 @@ class Program:
     missed_run_policy: MissedRunPolicy = MissedRunPolicy.RUN_LATE
     external_interruption_policy: InterruptionPolicy = InterruptionPolicy.PAUSE
     watering_window: WateringWindow | None = None
+
+    def __post_init__(self) -> None:
+        # Every construction path (stored config, websocket payloads, tests)
+        # may pass plain times or ISO strings; hold StartTime uniformly.
+        self.nominal_start_times = [
+            StartTime.normalize(entry) for entry in self.nominal_start_times
+        ]
 
 
 # ---------------------------------------------------------------------------

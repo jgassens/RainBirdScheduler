@@ -123,9 +123,31 @@ function recurrenceSummary(program) {
   else if (rec.kind === "even_days") base = "Even days";
   else base = `Every ${rec.interval_days ?? "?"} days`;
   const starts = (program.nominal_start_times || [])
-    .map((time) => time.slice(0, 5))
+    .map((start) => fmtStartTime(start))
     .join(", ");
   return `${base} at ${starts || "—"}`;
+}
+
+/* One program start time: legacy "HH:MM:SS" strings and the current
+ * {kind, at, offset_minutes} objects both occur in the wild. */
+function normalizeStart(start) {
+  if (typeof start === "string") {
+    return { kind: "clock", at: start, offset_minutes: 0 };
+  }
+  return {
+    kind: start?.kind || "clock",
+    at: start?.at || null,
+    offset_minutes: Number(start?.offset_minutes || 0),
+  };
+}
+
+function fmtStartTime(start) {
+  const s = normalizeStart(start);
+  if (s.kind === "clock") return (s.at || "??:??").slice(0, 5);
+  const base = s.kind === "sunrise" ? "sunrise" : "sunset";
+  if (!s.offset_minutes) return base;
+  const sign = s.offset_minutes < 0 ? "−" : "+";
+  return `${base} ${sign}${Math.abs(s.offset_minutes)}m`;
 }
 
 /* Per-tab explainers. Every page opens with a concrete scenario, then defines
@@ -198,7 +220,13 @@ const HELP = {
     happens if a start time lands in a nonexistent hour on spring-forward
     night: shift to the first valid instant, or skip that one start.</p>
     <p><b class="k">Start times</b> — the whole zone list runs once per start
-    time. Two starts = the full program twice that day.</p>
+    time. Two starts = the full program twice that day. Each start is either
+    a fixed <i>clock</i> time or <i>sunrise/sunset</i> plus an offset in
+    minutes (negative = before, e.g. sunrise −45 finishes watering before the
+    sun is up). Solar starts follow the season automatically using Home
+    Assistant's home location; the exact resolved time for each day is shown
+    on the Overview schedule. Sunrise/sunset are instants, so the DST rule
+    never applies to them.</p>
     <p><b class="k">Zone rows</b> — <i>Order</i> is the watering sequence
     (one zone at a time, always). <i>Runtime override</i> replaces the zone's
     default base minutes just for this program. <i>Offset</i> shifts this
@@ -1361,7 +1389,9 @@ class RainBirdSchedulerPanel extends HTMLElement {
         months: null,
         dst_nonexistent_policy: "shift_forward",
       },
-      nominal_start_times: ["06:00:00"],
+      nominal_start_times: [
+        { kind: "clock", at: "06:00:00", offset_minutes: 0 },
+      ],
       zone_steps: [],
       adjustment_provider: {
         kind: "fixed",
@@ -1425,13 +1455,29 @@ class RainBirdSchedulerPanel extends HTMLElement {
       .join("");
 
     const startInputs = draft.nominal_start_times
-      .map(
-        (time, index) => `
-        <span class="row" style="display:inline-flex">
-          <input type="time" data-start-index="${index}" value="${time.slice(0, 5)}">
+      .map((raw, index) => {
+        const start = normalizeStart(raw);
+        const kindSelect = `
+          <select data-start-kind="${index}">
+            <option value="clock" ${start.kind === "clock" ? "selected" : ""}>Clock</option>
+            <option value="sunrise" ${start.kind === "sunrise" ? "selected" : ""}>Sunrise</option>
+            <option value="sunset" ${start.kind === "sunset" ? "selected" : ""}>Sunset</option>
+          </select>`;
+        const valueInput =
+          start.kind === "clock"
+            ? `<input type="time" data-start-index="${index}"
+                value="${(start.at || "06:00:00").slice(0, 5)}">`
+            : `<input type="number" data-start-offset="${index}"
+                value="${start.offset_minutes}" min="-600" max="600" step="5"
+                style="width:72px" title="Minutes relative to ${start.kind};
+                negative starts before it"><span class="muted">min</span>`;
+        return `
+        <span class="row" style="display:inline-flex;align-items:center;gap:4px">
+          ${kindSelect}
+          ${valueInput}
           <button class="btn small warn" data-action="start-remove" data-index="${index}">✕</button>
-        </span>`,
-      )
+        </span>`;
+      })
       .join("");
 
     const rec = draft.recurrence;
@@ -1632,8 +1678,35 @@ class RainBirdSchedulerPanel extends HTMLElement {
     );
     root.querySelectorAll("[data-start-index]").forEach((input) =>
       input.addEventListener("change", () => {
-        this._draft.nominal_start_times[Number(input.dataset.startIndex)] =
-          `${input.value}:00`;
+        this._draft.nominal_start_times[Number(input.dataset.startIndex)] = {
+          kind: "clock",
+          at: `${input.value}:00`,
+          offset_minutes: 0,
+        };
+      }),
+    );
+    root.querySelectorAll("[data-start-kind]").forEach((select) =>
+      select.addEventListener("change", () => {
+        const index = Number(select.dataset.startKind);
+        const current = normalizeStart(this._draft.nominal_start_times[index]);
+        this._draft.nominal_start_times[index] =
+          select.value === "clock"
+            ? { kind: "clock", at: current.at || "06:00:00", offset_minutes: 0 }
+            : { kind: select.value, at: null, offset_minutes: 0 };
+        // The value input switches between a time and an offset field.
+        this.render();
+      }),
+    );
+    root.querySelectorAll("[data-start-offset]").forEach((input) =>
+      input.addEventListener("change", () => {
+        const index = Number(input.dataset.startOffset);
+        const current = normalizeStart(this._draft.nominal_start_times[index]);
+        const clamped = Math.max(-600, Math.min(600, Number(input.value) || 0));
+        this._draft.nominal_start_times[index] = {
+          kind: current.kind,
+          at: null,
+          offset_minutes: clamped,
+        };
       }),
     );
     root.querySelectorAll("[data-weekday]").forEach((input) =>
@@ -2288,7 +2361,11 @@ class RainBirdSchedulerPanel extends HTMLElement {
       }
       case "start-add":
         this._collectDraft();
-        this._draft.nominal_start_times.push("06:00:00");
+        this._draft.nominal_start_times.push({
+          kind: "clock",
+          at: "06:00:00",
+          offset_minutes: 0,
+        });
         this.render();
         break;
       case "start-remove":

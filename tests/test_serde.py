@@ -275,6 +275,65 @@ def test_observation_roundtrips_zone_reported_times() -> None:
     assert loaded.zone_reported_at("zone-c") == NOW
 
 
+def test_start_time_legacy_string_loads_as_clock() -> None:
+    from custom_components.rainbird_scheduler.models import (
+        StartKind,
+        StartTime,
+    )
+
+    loaded = serde.load(StartTime, "06:30:00")
+    assert loaded == StartTime(kind=StartKind.CLOCK, at=time(6, 30))
+    # And it dumps in the modern object form.
+    assert serde.dump(loaded) == {
+        "kind": "clock",
+        "at": "06:30:00",
+        "offset_minutes": 0,
+    }
+
+
+def test_start_time_solar_roundtrip_and_validation() -> None:
+    from custom_components.rainbird_scheduler.models import (
+        StartKind,
+        StartTime,
+    )
+
+    solar = StartTime(kind=StartKind.SUNSET, offset_minutes=-20)
+    assert serde.load(StartTime, serde.dump(solar)) == solar
+    with pytest.raises(ValueError):
+        serde.load(StartTime, {"kind": "sunrise", "offset_minutes": 700})
+    with pytest.raises(ValueError):
+        serde.load(StartTime, {"kind": "clock"})
+    with pytest.raises(ValueError):
+        serde.load(StartTime, "not-a-time")
+
+
+def test_program_with_mixed_start_times_roundtrips() -> None:
+    from custom_components.rainbird_scheduler.models import (
+        Program,
+        StartKind,
+        StartTime,
+    )
+
+    program = Program(
+        id="p1",
+        revision=1,
+        name="Mixed",
+        nominal_start_times=[
+            StartTime(kind=StartKind.CLOCK, at=time(6, 0)),
+            StartTime(kind=StartKind.SUNRISE, offset_minutes=-30),
+        ],
+    )
+    assert serde.load(Program, serde.dump(program)) == program
+    # A stored payload from before solar starts existed still loads.
+    legacy = serde.dump(program)
+    legacy["nominal_start_times"] = ["06:00:00", "19:15:00"]
+    loaded = serde.load(Program, legacy)
+    assert [s.at for s in loaded.nominal_start_times] == [
+        time(6, 0),
+        time(19, 15),
+    ]
+
+
 def test_observation_without_reported_map_falls_back() -> None:
     """Journals persisted before the field existed load and behave."""
     payload = serde.dump(

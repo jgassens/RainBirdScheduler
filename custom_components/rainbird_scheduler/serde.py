@@ -27,6 +27,8 @@ from typing import (
     overload,
 )
 
+from .models import StartTime
+
 _NONE_TYPE = type(None)
 
 
@@ -120,6 +122,15 @@ def load(target: Any, data: Any) -> Any:
         }
 
     if isinstance(target, type):
+        if target is StartTime and isinstance(data, str):
+            # Stores written before solar starts existed hold plain
+            # "HH:MM:SS" strings; they mean a clock start.
+            try:
+                return StartTime.normalize(data)
+            except ValueError as err:
+                raise ValueError(
+                    f"{data!r} is not a valid start time"
+                ) from err
         if dataclasses.is_dataclass(target):
             hints = _hints(target)
             kwargs: dict[str, Any] = {}

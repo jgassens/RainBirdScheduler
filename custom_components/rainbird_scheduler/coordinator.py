@@ -691,11 +691,18 @@ class SchedulerCoordinator:
         window_end = now + timedelta(days=PLAN_HORIZON_DAYS)
 
         occurrences: list[ProgramOccurrence] = []
+        recurrence_warnings: list[Any] = []
+        location = (
+            self.hass.config.latitude,
+            self.hass.config.longitude,
+        )
         for program in self.config.programs.values():
-            found, _warnings = occurrences_between(
-                program, tz, window_start, window_end, now
+            found, rec_warnings = occurrences_between(
+                program, tz, window_start, window_end, now,
+                location=location,
             )
             occurrences.extend(found)
+            recurrence_warnings.extend(rec_warnings)
 
         snapshots: dict[str, AdjustmentSnapshot] = {}
         for occurrence in occurrences:
@@ -706,7 +713,7 @@ class SchedulerCoordinator:
                 await self.build_adjustment_snapshot(owner, occurrence)
             )
 
-        self.timeline = compile_timeline(
+        timeline = compile_timeline(
             PlannerInput(
                 controller_config=self.config.controller,
                 programs=self.config.programs,
@@ -717,6 +724,15 @@ class SchedulerCoordinator:
                 compiled_at_utc=now,
             )
         )
+        if recurrence_warnings:
+            # Solar-start problems (no home location, polar day/night) are
+            # produced at occurrence expansion, before the planner runs;
+            # surface them alongside the compiled warnings.
+            timeline = dataclasses.replace(
+                timeline,
+                warnings=(*timeline.warnings, *recurrence_warnings),
+            )
+        self.timeline = timeline
         self._occurrence_index = {
             occ.occurrence_id: occ for occ in occurrences
         }

@@ -57,7 +57,9 @@ and the reason for any delay, skip, or adjustment.
 
 - **Programs and recurrence** — weekdays, odd/even calendar days,
   every-N-days, multiple start times per day, watering windows, explicit DST
-  rules.
+  rules. Start times are fixed clock times or **sunrise/sunset ± minutes**,
+  resolved daily from Home Assistant's home location so schedules follow the
+  season.
 - **Automatic serialization** — overlapping requested starts are compiled into
   a non-overlapping plan with deliberate inter-zone gaps.
 - **Cycle+Soak** — quantized cycle allocation with soak intervals interleaved
