@@ -562,11 +562,25 @@ class RunExecutor:
         self._arm_at(self._now() + timedelta(seconds=seconds), handler)
 
     def _latest_permissible_start(self) -> datetime:
+        """Latest instant a not-yet-started run may still begin.
+
+        Anchored to the planner's first compiled step when that is later
+        than the nominal request: a run the planner deliberately deferred
+        behind another run's block (the "you have to wait N minutes"
+        case) gets its tolerance from the deferred start, not from a
+        requested time that was never executable.
+        """
         plan = self._plan()
         tolerance = timedelta(
             minutes=self._config().missed_run_tolerance_minutes
         )
-        return plan.requested_start_utc + tolerance
+        anchor = plan.requested_start_utc
+        first_planned = min(
+            (step.planned_start_utc for step in plan.steps), default=anchor
+        )
+        if first_planned > anchor:
+            anchor = first_planned
+        return anchor + tolerance
 
     def _zone_name(self, zone_id: str) -> str:
         """Best display name for a zone (config, then plan, then raw id)."""

@@ -250,3 +250,18 @@ def test_legacy_time_and_string_starts_still_work() -> None:
         time(9, 0),
         time(18, 30),
     ]
+
+
+def test_schedule_edit_suppresses_retroactive_occurrences() -> None:
+    """Changing start times mid-day must not project the NEW schedule
+    into the past: those phantom occurrences were never armed and must
+    neither launch late (double watering) nor record as missed."""
+    program = make_program("edited", ["zone-a"], start=time(5, 53))
+    # The user edited the schedule at 11:00 UTC (06:00 local).
+    program.schedule_updated_at_utc = datetime(2026, 6, 1, 11, 0, tzinfo=UTC)
+    start, end = window(datetime(2026, 6, 1, 5, 0, tzinfo=UTC), days=2)
+    occurrences, warnings = occurrences_between(program, TZ, start, end, CREATED)
+    assert not warnings
+    # June 1's 05:53 local (10:53 UTC) predates the edit: suppressed.
+    # June 2's occurrence is intact.
+    assert [occ.scheduled_start_local.day for occ in occurrences] == [2]

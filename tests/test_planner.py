@@ -368,3 +368,80 @@ def test_partial_skip_does_not_warn_of_cancellation() -> None:
     assert timeline.warnings == ()
     assert len(timeline.runs[0].steps) == 1
     assert timeline.runs[0].skipped_zones[0].zone_id == "off"
+
+
+def test_deferred_run_waits_out_soak_heavy_block() -> None:
+    """A run requested inside another run's span starts after the WHOLE
+    block — soak waits included. The executor is single-flight per
+    controller, so a plan that tucks a second run into a soak gap is
+    unexecutable and must never be compiled."""
+    zones = [
+        make_zone(
+            "lawn",
+            1,
+            base_runtime_minutes=Decimal(6),
+            max_cycle_minutes=3,
+            minimum_soak_minutes=60,
+        ),
+        make_zone("bed", 2, base_runtime_minutes=Decimal(5)),
+    ]
+    lawn = make_program("lawn-prog", ["lawn"], priority=2)
+    bed = make_program("bed-prog", ["bed"], priority=100)
+    occurrences = [
+        make_occurrence(lawn, NINE_AM),
+        # Requested squarely inside the lawn's 60-minute soak gap.
+        make_occurrence(bed, NINE_AM + timedelta(minutes=30)),
+    ]
+    timeline = compile_timeline(
+        make_input(make_controller(), [lawn, bed], zones, occurrences)
+    )
+    assert not timeline.conflicts
+    lawn_run = next(r for r in timeline.runs if r.program_id == lawn.id)
+    bed_run = next(r for r in timeline.runs if r.program_id == bed.id)
+    lawn_end = max(step.planned_end_utc for step in lawn_run.steps)
+    # Lawn block: 3 min + 60 min soak + 3 min -> ends 10:06.
+    assert lawn_end == NINE_AM + timedelta(minutes=66)
+    first_bed = min(step.planned_start_utc for step in bed_run.steps)
+    assert first_bed >= lawn_end
+    # The wait is visible up front: requested vs planned differ.
+    assert bed_run.steps[0].requested_start_utc == NINE_AM + timedelta(
+        minutes=30
+    )
+    # And the lawn's own soak interleaving is untouched inside its block.
+    assert [s.cycle_index for s in lawn_run.steps] == [1, 2]
+
+
+def test_deferred_run_skip_policy_drops_with_visible_conflict() -> None:
+    """With missed-run policy SKIP, a deferral past the tolerance is a
+    compile-time conflict — not a mystery skip half an hour after the
+    requested start."""
+    zones = [
+        make_zone(
+            "lawn",
+            1,
+            base_runtime_minutes=Decimal(6),
+            max_cycle_minutes=3,
+            minimum_soak_minutes=60,
+        ),
+        make_zone("bed", 2, base_runtime_minutes=Decimal(5)),
+    ]
+    lawn = make_program("lawn-prog", ["lawn"], priority=2)
+    bed = make_program(
+        "bed-prog",
+        ["bed"],
+        priority=100,
+        missed_run_policy=MissedRunPolicy.SKIP,
+    )
+    occurrences = [
+        make_occurrence(lawn, NINE_AM),
+        make_occurrence(bed, NINE_AM + timedelta(minutes=30)),
+    ]
+    timeline = compile_timeline(
+        make_input(make_controller(), [lawn, bed], zones, occurrences)
+    )
+    # Deferred to 10:06+, which exceeds 9:30 + 30 min tolerance.
+    assert [r.program_id for r in timeline.runs if r.steps] == [lawn.id]
+    assert any(
+        c.reason is SkipReason.MISSED_TOLERANCE and c.program_id == bed.id
+        for c in timeline.conflicts
+    )

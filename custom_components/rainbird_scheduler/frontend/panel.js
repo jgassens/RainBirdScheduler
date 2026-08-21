@@ -167,7 +167,13 @@ const HELP = {
     you asked for. "Planned" is what the compiler produced after serializing
     zones one-at-a-time, adding inter-zone gaps, and applying policies. If
     three zones all request 9:00, only the first is planned at 9:00 — the
-    others are planned to follow it. The panel never blurs the two.</p>
+    others are planned to follow it. The same rule holds between whole
+    programs: a run whose requested start lands while another run still owns
+    the controller (soak waits included — the controller stays reserved
+    through them) is planned after that run's block ends. The Planned column
+    is the "you have to wait N minutes" answer, shown before it happens;
+    whether a long wait runs late or skips is that program's <i>Missed
+    run</i> policy. The panel never blurs the two.</p>
     <p><b class="k">Schedule timeline</b> — one row per day for the coming
     week, on a shared hour axis. Each colored bar is one zone cycle (color =
     zone, see the legend); hover any bar for the program, zone, exact window

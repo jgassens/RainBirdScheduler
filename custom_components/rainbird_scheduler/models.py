@@ -523,6 +523,12 @@ class Program:
     missed_run_policy: MissedRunPolicy = MissedRunPolicy.RUN_LATE
     external_interruption_policy: InterruptionPolicy = InterruptionPolicy.PAUSE
     watering_window: WateringWindow | None = None
+    # When the recurrence or start times last changed. Occurrences the new
+    # schedule projects into the past — instants before this stamp — are
+    # phantoms: they were never armed, must not launch late (double
+    # watering), and must not be recorded as missed. ``None`` (legacy
+    # configs) applies no filter.
+    schedule_updated_at_utc: datetime | None = None
 
     def __post_init__(self) -> None:
         # Every construction path (stored config, websocket payloads, tests)

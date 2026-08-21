@@ -914,13 +914,28 @@ class SchedulerCoordinator:
             await self.async_recalculate()
             return
 
+        now = dt_util.utcnow()
+        deadline = self._occurrence_launch_deadline(occurrence)
+        if self.executor.is_active:
+            # Our own run holds the controller. Without this gate the
+            # precondition check below would see our zones in the
+            # observation and misfile the wait — and any eventual skip —
+            # as "external activity", pointing the user at a third party
+            # that does not exist.
+            if now <= deadline:
+                self._arm_launch_retry(occurrence)
+                return
+            self._record_occurrence_skip(
+                occurrence, program, SkipReason.CONTROLLER_BUSY
+            )
+            await self.async_recalculate()
+            return
+
         observation = self.build_observation()
         journal.last_observation = observation
         blocked = evaluate_preconditions(
             self.config.controller, program, observation, manual=False
         )
-        now = dt_util.utcnow()
-        deadline = self._occurrence_launch_deadline(occurrence)
         if blocked is not None:
             if blocked.transient and now <= deadline:
                 self._arm_launch_retry(occurrence)
@@ -1222,11 +1237,23 @@ class SchedulerCoordinator:
         self.config.controller.revision += 1
         await self._persist_config()
 
+    @staticmethod
+    def _schedule_fields(program: Program) -> Any:
+        return (
+            serde.dump(program.recurrence),
+            serde.dump(program.nominal_start_times),
+        )
+
     async def async_create_program(self, data: dict[str, Any]) -> Program:
         data = dict(data)
         data["id"] = uuid.uuid4().hex
         data["revision"] = 1
         program = serde.load(Program, data)
+        # No schedule stamp on creation: a brand-new program has no prior
+        # run today, so catching up a just-elapsed start (within the
+        # missed-run tolerance) is safe and intended, and a past-deadline
+        # start records an honest skip. The stamp exists for EDITS, where
+        # the old schedule may already have watered.
         self.config.programs[program.id] = program
         await self._persist_config()
         return program
@@ -1241,6 +1268,10 @@ class SchedulerCoordinator:
             raise RevisionConflictError(current.revision, serde.dump(current))
         updated = cast(Program, self._apply_patch(current, patch))
         updated.revision = current.revision + 1
+        if self._schedule_fields(updated) != self._schedule_fields(current):
+            # Recurrence or start times changed: earlier-today instants of
+            # the NEW schedule are phantoms and must not fire or record.
+            updated.schedule_updated_at_utc = dt_util.utcnow()
         self.config.programs[program_id] = updated
         await self._persist_config()
         return updated

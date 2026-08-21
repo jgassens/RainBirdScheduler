@@ -446,3 +446,78 @@ async def test_external_watering_records_intervention(
         )
     await hass.async_block_till_done()
     assert coordinator.external_watering is False
+
+
+async def test_busy_controller_retries_without_external_activity_label(
+    hass: HomeAssistant, scheduler_entry: MockConfigEntry
+) -> None:
+    """An occurrence firing while OUR OWN run holds the controller is a
+    busy-wait, never an "external_activity" skip: that label sends the
+    user hunting for a third party that does not exist."""
+    await setup_scheduler(hass, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+    started = register_fake_controller(hass)
+    zone_a = zone_id_for(coordinator, 1)
+    zone_b = zone_id_for(coordinator, 2)
+
+    # A long manual run occupies the controller...
+    await coordinator.async_run_zones(
+        [{"entity_id": "switch.rain_bird_sprinkler_1", "duration": 45}]
+    )
+    await hass.async_block_till_done()
+    assert coordinator.executor.is_active
+    assert started == [("switch.rain_bird_sprinkler_1", 45)]
+
+    # ...when a scheduled program comes due one minute from now.
+    await coordinator.async_create_program(
+        program_payload([zone_b], local_start(timedelta(minutes=1)), "Due")
+    )
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=70))
+    await hass.async_block_till_done()
+
+    # No zone was started for it, no skip was recorded, and the launch
+    # retry loop owns the occurrence.
+    assert len(started) == 1
+    assert coordinator._retry_occurrences
+    assert not any(
+        run.reason == SkipReason.EXTERNAL_ACTIVITY.value
+        for run in coordinator.history.history.runs
+    )
+    _ = zone_a
+
+
+async def test_schedule_edit_does_not_retrofire_todays_past_start(
+    hass: HomeAssistant, scheduler_entry: MockConfigEntry
+) -> None:
+    """Editing start times mid-day must not launch (or record as missed)
+    the NEW schedule's already-elapsed instant for today — that phantom
+    was never armed, and launching it can double-water right after a
+    completed morning run."""
+    await setup_scheduler(hass, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+    started = register_fake_controller(hass)
+    program = await coordinator.async_create_program(
+        program_payload(
+            [zone_id_for(coordinator, 1)],
+            local_start(timedelta(hours=6)),
+            "Future",
+        )
+    )
+    await hass.async_block_till_done()
+
+    # The user drags the start to five minutes ago.
+    await coordinator.async_update_program(
+        program.id,
+        {"nominal_start_times": [backdated_start(5).isoformat()]},
+        expected_revision=program.revision,
+    )
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=70))
+    await hass.async_block_till_done()
+
+    assert started == []
+    assert not any(
+        record.program_id == program.id
+        for record in coordinator.history.history.runs
+    )

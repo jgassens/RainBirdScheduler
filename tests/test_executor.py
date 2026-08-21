@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -304,3 +305,37 @@ async def test_shutdown_cancels_armed_timer_and_is_idempotent() -> None:
     # Nothing fires afterwards; the journal is left untouched.
     await rig.tm.advance(15 * 60)
     assert rig.journal().state is ExecutorState.WATERING
+
+
+async def test_prestart_tolerance_anchors_to_deferred_planned_start() -> None:
+    """A run the planner deferred behind another block measures its
+    start tolerance from the deferred (planned) start, not from a
+    requested time that was never executable."""
+    rig = three_zone_rig()
+    deferred = rig.plan.steps[0].planned_start_utc + timedelta(hours=4)
+    plan = replace(
+        rig.plan,
+        steps=tuple(
+            replace(
+                step,
+                planned_start_utc=step.planned_start_utc + timedelta(hours=4),
+                planned_end_utc=step.planned_end_utc + timedelta(hours=4),
+            )
+            for step in rig.plan.steps
+        ),
+    )
+    # The controller looks busy at the deferred start: pre-start pause.
+    rig.journal().last_observation = rig.driver.make_observation(
+        {"ghost-zone"}
+    )
+    rig.tm.now = deferred
+    await rig.executor.async_start_run(plan)
+    assert rig.journal().state is ExecutorState.PAUSED_EXTERNAL
+    assert rig.driver.start_calls == []
+
+    # It clears 10 minutes later — hours past requested+tolerance, but
+    # well inside the DEFERRED start + tolerance: the run must begin.
+    await rig.tm.advance(10 * 60)
+    await rig.zone_event("ghost-zone", False, active=set())
+    assert rig.journal().state is ExecutorState.WATERING
+    assert len(rig.driver.start_calls) == 1

@@ -208,6 +208,16 @@ def occurrences_between(
             for utc_start, _start in resolved:
                 if not window_start_utc <= utc_start < window_end_utc:
                     continue
+                if (
+                    program.schedule_updated_at_utc is not None
+                    and utc_start < program.schedule_updated_at_utc
+                ):
+                    # The schedule changed after this instant: the
+                    # occurrence is a projection of the NEW schedule into
+                    # the past. It was never armed, so launching it late
+                    # would double-water and recording it as missed would
+                    # be noise.
+                    continue
                 occurrence_id = make_occurrence_id(program.id, utc_start)
                 if occurrence_id in seen_ids:
                     continue

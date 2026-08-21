@@ -381,28 +381,79 @@ def _schedule(
     conflicts: list[PlannerConflict],
 ) -> None:
     gap = timedelta(seconds=inp.controller_config.inter_zone_gap_seconds)
-    pending = [item for item in work_items if item.cycles]
-    if not pending:
+    eligible = [item for item in work_items if item.cycles]
+    if not eligible:
         return
-    cursor = min(item.next_eligible_utc for item in pending)
 
+    # One run occupies the controller from its first step to its last —
+    # soak waits included. The executor is strictly single-flight per
+    # controller, so steps of different occurrences must never interleave
+    # (a plan that tucks another run into a soak gap is unexecutable and
+    # surfaces later as a mystifying busy-skip). Occurrences claim the
+    # controller in request order; a later request that lands inside an
+    # earlier run's block simply waits: its planned start is pushed to
+    # the block's end, and the requested-vs-planned columns show the wait
+    # up front. The missed-run policy then decides run-late vs skip in
+    # _enforce_lateness.
+    by_occurrence: dict[str, list[_WorkItem]] = {}
+    for item in eligible:
+        by_occurrence.setdefault(item.occurrence.occurrence_id, []).append(
+            item
+        )
+
+    def claim_order(
+        items: list[_WorkItem],
+    ) -> tuple[datetime, int, datetime, str]:
+        return (
+            min(item.requested_start_utc for item in items),
+            items[0].program.priority,
+            items[0].occurrence.created_at_utc,
+            items[0].occurrence.occurrence_id,
+        )
+
+    controller_free: datetime | None = None
+    for pending in sorted(by_occurrence.values(), key=claim_order):
+        build = builds[pending[0].occurrence.occurrence_id]
+        cursor = min(item.next_eligible_utc for item in pending)
+        if controller_free is not None and cursor < controller_free:
+            cursor = controller_free
+        _schedule_occurrence(inp, pending, build, conflicts, cursor, gap)
+        if build.steps and not build.dropped:
+            block_end = max(step.planned_end_utc for step in build.steps)
+            controller_free = block_end + gap
+
+
+def _schedule_occurrence(
+    inp: PlannerInput,
+    pending: list[_WorkItem],
+    build: _OccurrenceBuild,
+    conflicts: list[PlannerConflict],
+    cursor: datetime,
+    gap: timedelta,
+) -> None:
+    """Lay out one occurrence's cycles from ``cursor`` onward."""
     while any(item.cycles for item in pending):
+        if build.dropped:
+            for item in pending:
+                item.cycles.clear()
+            return
         ready = [
             item
             for item in pending
             if item.cycles and item.next_eligible_utc <= cursor
         ]
         if not ready:
-            cursor = min(
-                item.next_eligible_utc for item in pending if item.cycles
+            cursor = max(
+                cursor,
+                min(
+                    item.next_eligible_utc
+                    for item in pending
+                    if item.cycles
+                ),
             )
             continue
 
         item = min(ready, key=lambda entry: entry.sort_key)
-        build = builds[item.occurrence.occurrence_id]
-        if build.dropped:
-            item.cycles.clear()
-            continue
 
         duration = item.cycles[0]
         window = item.program.watering_window
