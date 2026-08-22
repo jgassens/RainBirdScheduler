@@ -445,3 +445,82 @@ def test_deferred_run_skip_policy_drops_with_visible_conflict() -> None:
         c.reason is SkipReason.MISSED_TOLERANCE and c.program_id == bed.id
         for c in timeline.conflicts
     )
+
+
+def test_collision_detector_withholds_interleaved_runs() -> None:
+    """White-box: if a future _schedule regression compiles interleaved
+    runs again, the detector must withhold the offender loudly instead
+    of emitting an unexecutable plan."""
+    from custom_components.rainbird_scheduler.models import (
+        AdjustmentSnapshot,
+        ProviderKind,
+        RunStep,
+    )
+    from custom_components.rainbird_scheduler.planner import (
+        PlannerInput,
+        _detect_collisions,
+        _OccurrenceBuild,
+    )
+
+    zones = [make_zone("a", 1), make_zone("b", 2)]
+    lawn = make_program("lawn", ["a"])
+    bed = make_program("bed", ["b"])
+    lawn_occ = make_occurrence(lawn, NINE_AM)
+    bed_occ = make_occurrence(bed, NINE_AM + timedelta(minutes=10))
+    snapshot = AdjustmentSnapshot(
+        provider_kind=ProviderKind.FIXED,
+        computed_at_utc=NINE_AM,
+        per_zone={},
+    )
+
+    def step(index, zone, start_min, minutes, requested):
+        return RunStep(
+            index=index,
+            zone_id=zone.id,
+            zone_name=zone.display_name,
+            station_number=zone.reference.station_number,
+            cycle_index=index + 1,
+            cycle_count=2,
+            requested_start_utc=requested,
+            planned_start_utc=NINE_AM + timedelta(minutes=start_min),
+            planned_end_utc=NINE_AM + timedelta(minutes=start_min + minutes),
+            duration_minutes=minutes,
+            exact_minutes=Decimal(minutes),
+        )
+
+    # Lawn block 9:00-9:35 with a soak hole 9:05-9:30; bed tucked inside
+    # the hole — the exact pre-0.6.0 interleave.
+    lawn_build = _OccurrenceBuild(
+        occurrence=lawn_occ,
+        program=lawn,
+        snapshot=snapshot,
+        steps=[
+            step(0, zones[0], 0, 5, lawn_occ.scheduled_start_utc),
+            step(1, zones[0], 30, 5, lawn_occ.scheduled_start_utc),
+        ],
+    )
+    bed_build = _OccurrenceBuild(
+        occurrence=bed_occ,
+        program=bed,
+        snapshot=snapshot,
+        steps=[step(0, zones[1], 10, 5, bed_occ.scheduled_start_utc)],
+    )
+    builds = {
+        lawn_occ.occurrence_id: lawn_build,
+        bed_occ.occurrence_id: bed_build,
+    }
+    conflicts: list = []
+    warnings: list = []
+    inp = make_input(
+        make_controller(), [lawn, bed], zones, [lawn_occ, bed_occ]
+    )
+    assert isinstance(inp, PlannerInput)
+
+    _detect_collisions(inp, builds, conflicts, warnings)
+
+    # The interleaved bed run is withheld; the lawn block survives.
+    assert bed_build.dropped and not bed_build.steps
+    assert not lawn_build.dropped
+    assert [c.reason for c in conflicts] == [SkipReason.PLANNER_COLLISION]
+    assert "begins inside" in conflicts[0].message
+    assert warnings and "collision detector" in warnings[0].message

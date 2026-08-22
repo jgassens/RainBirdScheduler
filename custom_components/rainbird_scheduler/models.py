@@ -235,6 +235,10 @@ class SkipReason(StrEnum):
     SOURCE_UNAVAILABLE = "source_unavailable"
     DST_NONEXISTENT = "dst_nonexistent"
     COMMAND_FAILED = "command_failed"
+    # The planner's own collision detector refused an overlapping plan.
+    # Reaching this reason means a planner bug; the offending run is
+    # withheld rather than handed to the executor as unexecutable work.
+    PLANNER_COLLISION = "planner_collision"
 
 
 class EarlyEndClassification(StrEnum):

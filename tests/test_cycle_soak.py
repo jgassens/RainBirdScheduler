@@ -270,3 +270,105 @@ async def test_second_cycle_waits_for_planned_soak_start() -> None:
     assert rig.history.finished == [
         (rig.plan.run_id, RunOutcome.COMPLETED, None)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Controller-wide collision invariants across MULTIPLE runs. The
+# single-occurrence property above cannot see the failure class where two
+# runs' steps interleave without overlapping (each run tucked into the
+# other's soak gaps) — the exact bug behind the sunset-program busy-skips.
+# ---------------------------------------------------------------------------
+
+multi_run_specs = st.lists(
+    st.tuples(
+        # Per-program zone specs: (base minutes, max cycle, soak minutes).
+        st.lists(
+            st.tuples(
+                st.decimals(
+                    min_value=Decimal(1),
+                    max_value=Decimal(20),
+                    allow_nan=False,
+                    allow_infinity=False,
+                    places=0,
+                ),
+                st.one_of(st.none(), st.integers(min_value=1, max_value=5)),
+                st.integers(min_value=0, max_value=90),
+            ),
+            min_size=1,
+            max_size=3,
+        ),
+        # Occurrence start offsets from the anchor, in minutes: chosen
+        # small so runs frequently collide with each other's blocks.
+        st.lists(
+            st.integers(min_value=0, max_value=150), min_size=1, max_size=2
+        ),
+    ),
+    min_size=1,
+    max_size=3,
+)
+
+
+@settings(max_examples=60, deadline=None)
+@given(specs=multi_run_specs)
+def test_runs_never_overlap_or_interleave(specs) -> None:
+    zones = []
+    programs = []
+    occurrences = []
+    station = 0
+    for p_index, (zone_specs_, offsets) in enumerate(specs):
+        zone_ids = []
+        for base, max_cycle, soak in zone_specs_:
+            station += 1
+            zone_id = f"z{station}"
+            zone_ids.append(zone_id)
+            zones.append(
+                make_zone(
+                    zone_id,
+                    station,
+                    base_runtime_minutes=base,
+                    max_cycle_minutes=max_cycle,
+                    minimum_soak_minutes=soak,
+                )
+            )
+        program = make_program(f"p{p_index}", zone_ids, priority=p_index + 1)
+        programs.append(program)
+        for offset in sorted(set(offsets)):
+            occurrences.append(
+                make_occurrence(
+                    program, NINE_AM + timedelta(minutes=offset)
+                )
+            )
+
+    timeline = compile_timeline(
+        make_input(make_controller(), programs, zones, occurrences)
+    )
+
+    # The collision detector must stay silent on a healthy compile: any
+    # PLANNER_COLLISION here is itself a scheduling bug.
+    from custom_components.rainbird_scheduler.models import SkipReason
+
+    assert not any(
+        c.reason is SkipReason.PLANNER_COLLISION for c in timeline.conflicts
+    )
+
+    populated = [run for run in timeline.runs if run.steps]
+
+    # Every step pair across ALL runs: non-overlapping, gap respected.
+    all_steps = sorted(
+        (step for run in populated for step in run.steps),
+        key=lambda step: step.planned_start_utc,
+    )
+    for earlier, later in pairwise(all_steps):
+        assert later.planned_start_utc >= earlier.planned_end_utc + GAP
+
+    # Whole-run blocks (soak waits included) are pairwise disjoint: no
+    # run ever starts inside another run's span.
+    spans = sorted(
+        (
+            min(s.planned_start_utc for s in run.steps),
+            max(s.planned_end_utc for s in run.steps),
+        )
+        for run in populated
+    )
+    for (_, earlier_end), (later_start, _) in pairwise(spans):
+        assert later_start >= earlier_end + GAP

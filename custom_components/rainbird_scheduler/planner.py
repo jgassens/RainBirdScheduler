@@ -22,6 +22,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, tzinfo
 from decimal import ROUND_HALF_UP, Decimal
+from itertools import pairwise
 
 from .const import MAX_COMMAND_MINUTES
 from .models import (
@@ -256,6 +257,7 @@ def compile_timeline(inp: PlannerInput) -> CompiledControllerTimeline:
 
     _schedule(inp, work_items, builds, conflicts)
     _enforce_lateness(inp, builds, conflicts)
+    _detect_collisions(inp, builds, conflicts, warnings)
 
     runs = tuple(
         _finalize_run(inp, build)
@@ -594,6 +596,102 @@ def _enforce_lateness(
                     ),
                 )
             )
+
+
+def _detect_collisions(
+    inp: PlannerInput,
+    builds: dict[str, _OccurrenceBuild],
+    conflicts: list[PlannerConflict],
+    warnings: list[PlannerWarning],
+) -> None:
+    """Independent no-overlap verifier over the finished schedule.
+
+    The scheduler above is *believed* to serialize runs; this pass
+    *checks* it, so the invariant survives future edits to `_schedule`.
+    Two guarantees are enforced on every compile:
+
+    * Steps across ALL runs are pairwise non-overlapping and separated
+      by the inter-zone gap.
+    * Whole runs never interleave: each run's block (first step start to
+      last step end, soak waits included) is disjoint from every other
+      run's block. The executor is single-flight per controller, so an
+      interleaved plan is unexecutable no matter how valid its steps
+      look individually.
+
+    A violating run is withheld with a PLANNER_COLLISION conflict — a
+    loudly-reported planner bug — instead of being handed to the
+    executor, where it would surface hours later as a mystery busy-skip.
+    """
+    gap = timedelta(seconds=inp.controller_config.inter_zone_gap_seconds)
+    active = [b for b in builds.values() if b.steps and not b.dropped]
+    # Verify in execution order; on violation drop the later block so the
+    # survivors remain a valid serial plan.
+    active.sort(key=lambda b: min(s.planned_start_utc for s in b.steps))
+
+    def _span(build: _OccurrenceBuild) -> tuple[datetime, datetime]:
+        return (
+            min(s.planned_start_utc for s in build.steps),
+            max(s.planned_end_utc for s in build.steps),
+        )
+
+    def _withhold(build: _OccurrenceBuild, detail: str) -> None:
+        build.dropped = True
+        build.steps.clear()
+        conflicts.append(
+            PlannerConflict(
+                occurrence_id=build.occurrence.occurrence_id,
+                program_id=build.program.id,
+                zone_id=None,
+                reason=SkipReason.PLANNER_COLLISION,
+                message=(
+                    f"Planner bug: {detail}. The run was withheld instead "
+                    "of being handed to the controller; please report this."
+                ),
+            )
+        )
+        warnings.append(
+            PlannerWarning(
+                occurrence_id=build.occurrence.occurrence_id,
+                program_id=build.program.id,
+                zone_id=None,
+                message=(
+                    f"Program {build.program.name!r} was withheld by the "
+                    f"collision detector: {detail}."
+                ),
+            )
+        )
+
+    # Intra-run: consecutive steps must respect the inter-zone gap.
+    for build in list(active):
+        steps = sorted(build.steps, key=lambda s: s.planned_start_utc)
+        for earlier, later in pairwise(steps):
+            if later.planned_start_utc < earlier.planned_end_utc + gap:
+                _withhold(
+                    build,
+                    f"steps {earlier.zone_name!r} and {later.zone_name!r} "
+                    "overlap within one run",
+                )
+                active.remove(build)
+                break
+
+    # Inter-run: blocks must be disjoint, in order, gap-separated.
+    survivor: _OccurrenceBuild | None = None
+    for build in list(active):
+        if survivor is None:
+            survivor = build
+            continue
+        _prev_start, prev_end = _span(survivor)
+        start, _end = _span(build)
+        if start < prev_end + gap:
+            _withhold(
+                build,
+                f"run {build.program.name!r} "
+                f"({start.isoformat()}) begins inside "
+                f"{survivor.program.name!r}'s block "
+                f"(ends {prev_end.isoformat()})",
+            )
+            continue
+        survivor = build
 
 
 def _finalize_run(inp: PlannerInput, build: _OccurrenceBuild) -> RunPlan:
