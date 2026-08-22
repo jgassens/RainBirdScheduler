@@ -414,3 +414,80 @@ async def test_config_update_conflict_on_stale_revision(
     result = await client.receive_json()
     assert not result["success"]
     assert result["error"]["code"] == "revision_conflict"
+
+
+async def test_manual_run_during_active_run_reports_controller_busy(
+    hass: HomeAssistant, hass_ws_client, scheduler_entry: MockConfigEntry
+) -> None:
+    """Manual-vs-active is refused by the executor's single flight, and
+    the refusal must reach the panel as code "controller_busy" with the
+    active program's name — never an unhandled "Unknown error"."""
+    client = await _client(hass, hass_ws_client, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+
+    async def fake_start(call) -> None:
+        entity_id = call.data["entity_id"]
+        entity_id = entity_id[0] if isinstance(entity_id, list) else entity_id
+        state = hass.states.get(entity_id)
+        hass.states.async_set(entity_id, "on", dict(state.attributes))
+
+    hass.services.async_register("rainbird", "start_irrigation", fake_start)
+
+    zone_id = next(iter(coordinator.config.zones))
+    program = dict(PROGRAM_PAYLOAD)
+    program["name"] = "Occupier"
+    program["zone_steps"] = [
+        {"zone_id": zone_id, "position": 0, "enabled": True}
+    ]
+    await client.send_json(
+        {
+            "id": 1,
+            "type": f"{DOMAIN}/program/create",
+            "entry_id": scheduler_entry.entry_id,
+            "program": program,
+        }
+    )
+    result = await client.receive_json()
+    assert result["success"], result
+    program_id = result["result"]["program"]["id"]
+
+    # First manual run claims the controller.
+    await client.send_json(
+        {
+            "id": 2,
+            "type": f"{DOMAIN}/run/start",
+            "entry_id": scheduler_entry.entry_id,
+            "program_id": program_id,
+        }
+    )
+    result = await client.receive_json()
+    assert result["success"], result
+    assert coordinator.executor.is_active
+
+    # A second manual program run is refused with a clear reason.
+    await client.send_json(
+        {
+            "id": 3,
+            "type": f"{DOMAIN}/run/start",
+            "entry_id": scheduler_entry.entry_id,
+            "program_id": program_id,
+        }
+    )
+    result = await client.receive_json()
+    assert not result["success"]
+    assert result["error"]["code"] == "controller_busy"
+    assert "Occupier" in result["error"]["message"]
+
+    # Ad-hoc zone runs are refused the same way.
+    entity_id = coordinator.config.zones[zone_id].reference.last_known_entity_id
+    await client.send_json(
+        {
+            "id": 4,
+            "type": f"{DOMAIN}/run/start_zones",
+            "entry_id": scheduler_entry.entry_id,
+            "zones": [{"entity_id": entity_id, "duration": 5}],
+        }
+    )
+    result = await client.receive_json()
+    assert not result["success"]
+    assert result["error"]["code"] == "controller_busy"
