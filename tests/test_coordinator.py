@@ -497,10 +497,16 @@ async def test_schedule_edit_does_not_retrofire_todays_past_start(
     await setup_scheduler(hass, scheduler_entry)
     coordinator = scheduler_entry.runtime_data
     started = register_fake_controller(hass)
+    # A near-future start that stays on today's date (local_start wraps
+    # to a past time-of-day when now + delta crosses local midnight,
+    # which would make the CREATE itself record a legitimate skip).
+    now_local = dt_util.now()
+    if (now_local + timedelta(minutes=10)).date() != now_local.date():
+        pytest.skip("too close to local midnight for a same-day start")
     program = await coordinator.async_create_program(
         program_payload(
             [zone_id_for(coordinator, 1)],
-            local_start(timedelta(hours=6)),
+            local_start(timedelta(minutes=10)),
             "Future",
         )
     )
@@ -521,3 +527,53 @@ async def test_schedule_edit_does_not_retrofire_todays_past_start(
         record.program_id == program.id
         for record in coordinator.history.history.runs
     )
+
+
+async def test_daily_midnight_recompile_keeps_timeline_fresh(
+    hass: HomeAssistant, scheduler_entry: MockConfigEntry
+) -> None:
+    """Solar starts move every day and the compile window rolls, so the
+    timeline (and with it the collision detector) must recompile daily
+    on its own — never only as a side effect of a run finishing."""
+    await setup_scheduler(hass, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+    await coordinator.async_create_program(
+        program_payload(
+            [zone_id_for(coordinator, 1)],
+            local_start(timedelta(hours=23)),
+            "Daily",
+        )
+    )
+    await hass.async_block_till_done()
+    before = max(run.compiled_at_utc for run in coordinator.timeline.runs)
+
+    next_tick = dt_util.start_of_local_day() + timedelta(days=1, seconds=30)
+    async_fire_time_changed(hass, dt_util.as_utc(next_tick))
+    await hass.async_block_till_done()
+
+    after = max(run.compiled_at_utc for run in coordinator.timeline.runs)
+    assert after > before
+
+
+async def test_core_config_change_triggers_recompile(
+    hass: HomeAssistant, scheduler_entry: MockConfigEntry
+) -> None:
+    """Sunrise/sunset derive from the home location and timezone; a core
+    config change must recompute the plan."""
+    await setup_scheduler(hass, scheduler_entry)
+    coordinator = scheduler_entry.runtime_data
+    await coordinator.async_create_program(
+        program_payload(
+            [zone_id_for(coordinator, 1)],
+            local_start(timedelta(hours=23)),
+            "Daily",
+        )
+    )
+    await hass.async_block_till_done()
+    before = max(run.compiled_at_utc for run in coordinator.timeline.runs)
+
+    await hass.config.async_update(latitude=30.0, longitude=-97.0)
+    await hass.async_block_till_done()
+
+    after = max(run.compiled_at_utc for run in coordinator.timeline.runs)
+    assert after > before

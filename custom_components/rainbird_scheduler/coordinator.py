@@ -19,7 +19,12 @@ from typing import Any, cast
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_ON
-from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.core import (
+    EVENT_CORE_CONFIG_UPDATE,
+    Event,
+    HomeAssistant,
+    callback,
+)
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er, issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -27,6 +32,7 @@ from homeassistant.helpers.event import (
     async_call_later,
     async_track_point_in_utc_time,
     async_track_state_change_event,
+    async_track_time_change,
 )
 from homeassistant.util import dt as dt_util
 
@@ -140,6 +146,8 @@ class SchedulerCoordinator:
         self._unsub_registry: Any | None = None
         self._unsub_occurrence: Any | None = None
         self._unsub_retry: Any | None = None
+        self._unsub_daily: Any | None = None
+        self._unsub_core_config: Any | None = None
         self._ephemeral_programs: dict[str, Program] = {}
         self._occurrence_index: dict[str, ProgramOccurrence] = {}
         self._new_zone_found = False
@@ -229,6 +237,31 @@ class SchedulerCoordinator:
             er.EVENT_ENTITY_REGISTRY_UPDATED, self._on_registry_updated
         )
 
+        # The compiled window is a rolling 7 days and solar start times
+        # move every day, so the compile — and with it the collision
+        # detector and the panel preview — must never depend on a run
+        # happening to finish. Recompile unconditionally just after local
+        # midnight; that also wakes a scheduler whose next occurrence
+        # was beyond the window (seasonal programs) and would otherwise
+        # sleep until a restart.
+        @callback
+        def _daily_recompile(_now: datetime) -> None:
+            self._track_background(self.async_recalculate())
+
+        self._unsub_daily = async_track_time_change(
+            self.hass, _daily_recompile, hour=0, minute=0, second=30
+        )
+
+        # Sunrise/sunset are computed from the home location and the
+        # timezone; recompile when either changes.
+        @callback
+        def _core_config_updated(_event: Event[Any]) -> None:
+            self._track_background(self.async_recalculate())
+
+        self._unsub_core_config = self.hass.bus.async_listen(
+            EVENT_CORE_CONFIG_UPDATE, _core_config_updated
+        )
+
         await self.executor.async_recover()
         # A run whose pause cause cleared while HA was down would otherwise
         # wait for the next state-change event; nudge it with a fresh
@@ -261,6 +294,8 @@ class SchedulerCoordinator:
             self._unsub_registry,
             self._unsub_occurrence,
             self._unsub_retry,
+            self._unsub_daily,
+            self._unsub_core_config,
         ):
             if unsub is not None:
                 unsub()
@@ -268,6 +303,8 @@ class SchedulerCoordinator:
         self._unsub_registry = None
         self._unsub_occurrence = None
         self._unsub_retry = None
+        self._unsub_daily = None
+        self._unsub_core_config = None
         # The executor's armed timer must not outlive the coordinator: an
         # orphaned executor would keep issuing commands while the next
         # setup recovers the same journal.
